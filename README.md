@@ -8,7 +8,7 @@ Lianghui Zhu<sup>1,2</sup>, Yuxin Fang<sup>2,&dagger;</sup>, Bencheng Liao<sup>1
 
 (<sup>&dagger;</sup>) project lead, (<sup>#</sup>) corresponding author.
 
-ArXiv Preprint ([arXiv 2603.xxxxx](https://arxiv.org/abs/2603.xxxxx))
+ArXiv Preprint ([arXiv 2603.xxxxx](https://arxiv.org/abs/2603.15619))
 
 </div>
 
