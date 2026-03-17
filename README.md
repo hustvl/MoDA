@@ -1,6 +1,6 @@
 <div align="center">
 <h1>Mixture-of-Depths Attention</h1>
-<h3>Scaling Transformers Along the Depth Stream</h3>
+<h3>Scaling Attention Along the Depth</h3>
 
 Lianghui Zhu<sup>1,2</sup>, Yuxin Fang<sup>2,&dagger;</sup>, Bencheng Liao<sup>1,2</sup>, Shijie Wang<sup>2</sup>, Tianheng Cheng<sup>2</sup>, Zilong Huang<sup>2</sup>, Chen Chen<sup>2</sup>, Lai Wei<sup>2</sup>, Yutao Zeng<sup>2</sup>, Ya Wang<sup>2</sup>, Yi Lin<sup>2</sup>, Yu Li<sup>2</sup>, Xinggang Wang<sup>1,#</sup>
 
