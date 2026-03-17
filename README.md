@@ -21,8 +21,8 @@ ArXiv Preprint ([arXiv 2603.15619](https://arxiv.org/abs/2603.15619))
 ## TODO
 
 - [x] Release Mixture-of-Depths Attention (MoDA) paper on arXiv.
-- [] Release [MoDA Triton kernel](libs/moda_triton/fla/ops/moda/moda_v14.py) and corresponding test units.
-- [] Release [Chunk-Visible MoDA Triton kernel](libs/moda_triton/fla/ops/moda/moda_v16.py) and corresponding test units.
+- [ ] Release [MoDA Triton kernel](libs/moda_triton/fla/ops/moda/moda_v14.py) and corresponding test units.
+- [ ] Release [Chunk-Visible MoDA Triton kernel](libs/moda_triton/fla/ops/moda/moda_v16.py) and corresponding test units.
 - [ ] Release Non-Causal MoDA Triton kernel and corresponding test units.
 - [ ] Release full LLM training recipe and reproducible configs.
 - [ ] Release full vision tasks training recipe, i.e., Classification on ImageNet.
