@@ -1,0 +1,45 @@
+# test file
+test.py
+
+# data files
+data
+
+# bash scripts
+*.sh
+
+# docs
+docs/_build
+
+# intermediate files
+build
+dist
+*.egg-info
+dist-packages/*
+
+# experimental results
+exp
+results
+wandb
+*.csv
+*.png
+*.html
+
+# log and config files
+log.*
+*.log
+*.cfg
+*.ini
+
+# pycache
+__pycache__
+
+# saved model
+*.pkl
+*.pt
+*.pdf
+
+# vscode
+.vscode
+
+# macOS
+.DS_Store
