@@ -16,7 +16,7 @@ ArXiv Preprint ([arXiv 2603.15619](https://arxiv.org/abs/2603.15619))
 
 ## News
 
-* **` Mar. 16th, 2026`:** We released the *Mixture-of-Depths Attention* paper on arXiv. Code is coming soon.
+* **` Mar. 16th, 2026`:** We released the *Mixture-of-Depths Attention* paper on arXiv. Code is available now.
 
 ## TODO
 
