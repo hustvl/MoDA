@@ -71,6 +71,7 @@ def parallel_moda_fwd_kernel(
     USE_G: tl.constexpr,
     IS_VARLEN: tl.constexpr,
     USE_DEPTH: tl.constexpr,
+    IS_CAUSAL: tl.constexpr,
 ):
 
     i_v, i_t, i_bh = tl.program_id(0), tl.program_id(1), tl.program_id(2)
@@ -158,102 +159,145 @@ def parallel_moda_fwd_kernel(
     o_q = q_block_start + tl.arange(0, BT)
     o_q_base = o_q // moda_group_num
 
-    base_t_block_start = q_block_start // moda_group_num
+    if IS_CAUSAL:
+        base_t_block_start = q_block_start // moda_group_num
 
-    for i_s in range(0, base_t_block_start, BS):
+        for i_s in range(0, base_t_block_start, BS):
 
-        p_k = tl.make_block_ptr(
-            k + (bos_kv * H + i_h) * K,
-            (K, T_kv),
-            (1, H * K),
-            (0, i_s),
-            (BK, BS),
-            (0, 1),
-        )
-
-        p_v = tl.make_block_ptr(
-            v + (bos_kv * H + i_h) * V,
-            (T_kv, V),
-            (H * V, 1),
-            (i_s, i_v * BV),
-            (BS, BV),
-            (1, 0),
-        )
-
-        b_k = tl.load(p_k, boundary_check=(0, 1))
-        b_v = tl.load(p_v, boundary_check=(0, 1))
-
-        b_s = tl.dot(b_q, b_k) * scale * RCP_LN2
-
-        o_k = i_s + tl.arange(0, BS)
-        m_k = (o_k < base_t_block_start) & (o_k < T_kv)
-        if USE_G:
-            b_gk = tl.load(g_cumsum + (bos_kv + o_k) * HQ + i_hq, mask=m_k, other=0).to(
-                tl.float32
+            p_k = tl.make_block_ptr(
+                k + (bos_kv * H + i_h) * K,
+                (K, T_kv),
+                (1, H * K),
+                (0, i_s),
+                (BK, BS),
+                (0, 1),
             )
 
-            b_s += b_gq[:, None] - b_gk[None, :]
-
-        b_s = tl.where(m_k[None, :], b_s, float("-inf"))
-
-        b_m, b_mp = tl.maximum(b_m, tl.max(b_s, 1)), b_m
-
-        b_r = exp2(b_mp - b_m)
-
-        b_p = exp2(b_s - b_m[:, None])
-
-        b_acc = b_acc * b_r + tl.sum(b_p, 1)
-
-        b_o = b_o * b_r[:, None] + tl.dot(b_p.to(b_q.dtype), b_v)
-
-        b_mp = b_m
-
-    base_t_block_end = (q_block_end - 1) // moda_group_num + 1
-    base_t_block_end = tl.minimum(base_t_block_end, T_kv)
-
-    for i_s in range(base_t_block_start, base_t_block_end, BS):
-
-        p_k = tl.make_block_ptr(
-            k + (bos_kv * H + i_h) * K,
-            (K, T_kv),
-            (1, H * K),
-            (0, i_s),
-            (BK, BS),
-            (0, 1),
-        )
-        p_v = tl.make_block_ptr(
-            v + (bos_kv * H + i_h) * V,
-            (T_kv, V),
-            (H * V, 1),
-            (i_s, i_v * BV),
-            (BS, BV),
-            (1, 0),
-        )
-
-        o_k = i_s + tl.arange(0, BS)
-        m_k = o_k < T_kv
-
-        b_k = tl.load(p_k, boundary_check=(0, 1))
-        b_v = tl.load(p_v, boundary_check=(0, 1))
-
-        b_s = tl.dot(b_q, b_k) * scale * RCP_LN2
-
-        if USE_G:
-            b_gk = tl.load(g_cumsum + (bos_kv + o_k) * HQ + i_hq, mask=m_k, other=0).to(
-                tl.float32
+            p_v = tl.make_block_ptr(
+                v + (bos_kv * H + i_h) * V,
+                (T_kv, V),
+                (H * V, 1),
+                (i_s, i_v * BV),
+                (BS, BV),
+                (1, 0),
             )
-            b_s += b_gq[:, None] - b_gk[None, :]
 
-        b_s = tl.where(
-            (o_q_base[:, None] >= o_k[None, :]) & m_k[None, :], b_s, float("-inf")
-        )
+            b_k = tl.load(p_k, boundary_check=(0, 1))
+            b_v = tl.load(p_v, boundary_check=(0, 1))
 
-        b_m, b_mp = tl.maximum(b_m, tl.max(b_s, 1)), b_m
-        b_r = exp2(b_mp - b_m)
-        b_p = exp2(b_s - b_m[:, None])
-        b_acc = b_acc * b_r + tl.sum(b_p, 1)
-        b_o = b_o * b_r[:, None] + tl.dot(b_p.to(b_q.dtype), b_v)
-        b_mp = b_m
+            b_s = tl.dot(b_q, b_k) * scale * RCP_LN2
+
+            o_k = i_s + tl.arange(0, BS)
+            m_k = (o_k < base_t_block_start) & (o_k < T_kv)
+            if USE_G:
+                b_gk = tl.load(
+                    g_cumsum + (bos_kv + o_k) * HQ + i_hq, mask=m_k, other=0
+                ).to(tl.float32)
+
+                b_s += b_gq[:, None] - b_gk[None, :]
+
+            b_s = tl.where(m_k[None, :], b_s, float("-inf"))
+
+            b_m, b_mp = tl.maximum(b_m, tl.max(b_s, 1)), b_m
+
+            b_r = exp2(b_mp - b_m)
+
+            b_p = exp2(b_s - b_m[:, None])
+
+            b_acc = b_acc * b_r + tl.sum(b_p, 1)
+
+            b_o = b_o * b_r[:, None] + tl.dot(b_p.to(b_q.dtype), b_v)
+
+            b_mp = b_m
+
+        base_t_block_end = (q_block_end - 1) // moda_group_num + 1
+        base_t_block_end = tl.minimum(base_t_block_end, T_kv)
+
+        for i_s in range(base_t_block_start, base_t_block_end, BS):
+
+            p_k = tl.make_block_ptr(
+                k + (bos_kv * H + i_h) * K,
+                (K, T_kv),
+                (1, H * K),
+                (0, i_s),
+                (BK, BS),
+                (0, 1),
+            )
+            p_v = tl.make_block_ptr(
+                v + (bos_kv * H + i_h) * V,
+                (T_kv, V),
+                (H * V, 1),
+                (i_s, i_v * BV),
+                (BS, BV),
+                (1, 0),
+            )
+
+            o_k = i_s + tl.arange(0, BS)
+            m_k = o_k < T_kv
+
+            b_k = tl.load(p_k, boundary_check=(0, 1))
+            b_v = tl.load(p_v, boundary_check=(0, 1))
+
+            b_s = tl.dot(b_q, b_k) * scale * RCP_LN2
+
+            if USE_G:
+                b_gk = tl.load(
+                    g_cumsum + (bos_kv + o_k) * HQ + i_hq, mask=m_k, other=0
+                ).to(tl.float32)
+                b_s += b_gq[:, None] - b_gk[None, :]
+
+            b_s = tl.where(
+                (o_q_base[:, None] >= o_k[None, :]) & m_k[None, :], b_s, float("-inf")
+            )
+
+            b_m, b_mp = tl.maximum(b_m, tl.max(b_s, 1)), b_m
+            b_r = exp2(b_mp - b_m)
+            b_p = exp2(b_s - b_m[:, None])
+            b_acc = b_acc * b_r + tl.sum(b_p, 1)
+            b_o = b_o * b_r[:, None] + tl.dot(b_p.to(b_q.dtype), b_v)
+            b_mp = b_m
+    else:
+        # Non-causal mode only lifts the sequence-KV prefix mask.
+        for i_s in range(0, T_kv, BS):
+            p_k = tl.make_block_ptr(
+                k + (bos_kv * H + i_h) * K,
+                (K, T_kv),
+                (1, H * K),
+                (0, i_s),
+                (BK, BS),
+                (0, 1),
+            )
+            p_v = tl.make_block_ptr(
+                v + (bos_kv * H + i_h) * V,
+                (T_kv, V),
+                (H * V, 1),
+                (i_s, i_v * BV),
+                (BS, BV),
+                (1, 0),
+            )
+
+            o_k = i_s + tl.arange(0, BS)
+            m_k = o_k < T_kv
+
+            b_k = tl.load(p_k, boundary_check=(0, 1))
+            b_v = tl.load(p_v, boundary_check=(0, 1))
+
+            b_s = tl.dot(b_q, b_k) * scale * RCP_LN2
+
+            if USE_G:
+                b_gk = tl.load(
+                    g_cumsum + (bos_kv + o_k) * HQ + i_hq, mask=m_k, other=0
+                ).to(tl.float32)
+                b_s += b_gq[:, None] - b_gk[None, :]
+
+            b_s = tl.where(m_k[None, :], b_s, float("-inf"))
+
+            b_m, b_mp = tl.maximum(b_m, tl.max(b_s, 1)), b_m
+            b_r = exp2(b_mp - b_m)
+            b_p = exp2(b_s - b_m[:, None])
+            b_acc = b_acc * b_r + tl.sum(b_p, 1)
+            b_o = b_o * b_r[:, None] + tl.dot(b_p.to(b_q.dtype), b_v)
+            b_mp = b_m
 
     if USE_DEPTH:
 
@@ -344,6 +388,7 @@ def parallel_moda_fwd(
     cached_k: Optional[torch.Tensor] = None,
     cached_v: Optional[torch.Tensor] = None,
     moda_group_num: int = 1,
+    is_causal: bool = True,
     customized_BT: int = None,
     customized_BS: int = None,
     customized_BK: int = None,
@@ -464,6 +509,7 @@ def parallel_moda_fwd(
         BS=BS,
         BK=BK,
         BV=BV,
+        IS_CAUSAL=is_causal,
         num_warps=num_warps,
     )
     return o, lse
@@ -526,6 +572,7 @@ def parallel_moda_bwd_kernel_dq(
     IS_VARLEN: tl.constexpr,
     USE_G: tl.constexpr,
     USE_DEPTH: tl.constexpr,
+    IS_CAUSAL: tl.constexpr,
 ):
 
     i_v, i_t, i_bh = tl.program_id(0), tl.program_id(1), tl.program_id(2)
@@ -614,93 +661,135 @@ def parallel_moda_bwd_kernel_dq(
     o_q = q_block_start + tl.arange(0, BT)
     o_q_base = o_q // moda_group_num
 
-    base_t_block_start = q_block_start // moda_group_num
+    if IS_CAUSAL:
+        base_t_block_start = q_block_start // moda_group_num
 
-    for i_s in range(0, base_t_block_start, BS):
-        p_k = tl.make_block_ptr(
-            k + (i_n * T_kv * H + i_h) * K,
-            (K, T_kv),
-            (1, H * K),
-            (0, i_s),
-            (BK, BS),
-            (0, 1),
-        )
+        for i_s in range(0, base_t_block_start, BS):
+            p_k = tl.make_block_ptr(
+                k + (i_n * T_kv * H + i_h) * K,
+                (K, T_kv),
+                (1, H * K),
+                (0, i_s),
+                (BK, BS),
+                (0, 1),
+            )
 
-        p_v = tl.make_block_ptr(
-            v + (i_n * T_kv * H + i_h) * V,
-            (V, T_kv),
-            (1, H * V),
-            (i_v * BV, i_s),
-            (BV, BS),
-            (0, 1),
-        )
+            p_v = tl.make_block_ptr(
+                v + (i_n * T_kv * H + i_h) * V,
+                (V, T_kv),
+                (1, H * V),
+                (i_v * BV, i_s),
+                (BV, BS),
+                (0, 1),
+            )
 
-        o_k = i_s + tl.arange(0, BS)
-        m_k = (o_k < base_t_block_start) & (o_k < T_kv)
+            o_k = i_s + tl.arange(0, BS)
+            m_k = (o_k < base_t_block_start) & (o_k < T_kv)
 
-        b_k = tl.load(p_k, boundary_check=(0, 1))
-        b_v = tl.load(p_v, boundary_check=(0, 1))
+            b_k = tl.load(p_k, boundary_check=(0, 1))
+            b_v = tl.load(p_v, boundary_check=(0, 1))
 
-        b_s = tl.dot(b_q, b_k) * scale * RCP_LN2
-        if USE_G:
-            b_gk = tl.load(
-                g_cumsum + (i_n * T_kv + o_k) * HQ + i_hq, mask=m_k, other=0
-            ).to(tl.float32)
-            b_s += b_gq[:, None] - b_gk[None, :]
+            b_s = tl.dot(b_q, b_k) * scale * RCP_LN2
+            if USE_G:
+                b_gk = tl.load(
+                    g_cumsum + (i_n * T_kv + o_k) * HQ + i_hq, mask=m_k, other=0
+                ).to(tl.float32)
+                b_s += b_gq[:, None] - b_gk[None, :]
 
-        b_s = tl.where(m_k[None, :], b_s, float("-inf"))
+            b_s = tl.where(m_k[None, :], b_s, float("-inf"))
 
-        b_p = exp2(b_s - b_lse[:, None])
-        b_dp = tl.dot(b_do, b_v)
-        b_ds = b_p * (b_dp.to(tl.float32) - b_delta[:, None])
+            b_p = exp2(b_s - b_lse[:, None])
+            b_dp = tl.dot(b_do, b_v)
+            b_ds = b_p * (b_dp.to(tl.float32) - b_delta[:, None])
 
-        b_dq += tl.dot(b_ds.to(b_k.dtype), tl.trans(b_k))
-        if USE_G:
-            b_dg += tl.sum(b_ds, 1)
+            b_dq += tl.dot(b_ds.to(b_k.dtype), tl.trans(b_k))
+            if USE_G:
+                b_dg += tl.sum(b_ds, 1)
 
-    base_t_block_end = (q_block_end - 1) // moda_group_num + 1
-    base_t_block_end = tl.minimum(base_t_block_end, T_kv)
+        base_t_block_end = (q_block_end - 1) // moda_group_num + 1
+        base_t_block_end = tl.minimum(base_t_block_end, T_kv)
 
-    for i_s in range(base_t_block_start, base_t_block_end, BS):
-        p_k = tl.make_block_ptr(
-            k + (i_n * T_kv * H + i_h) * K,
-            (K, T_kv),
-            (1, H * K),
-            (0, i_s),
-            (BK, BS),
-            (0, 1),
-        )
-        p_v = tl.make_block_ptr(
-            v + (i_n * T_kv * H + i_h) * V,
-            (V, T_kv),
-            (1, H * V),
-            (i_v * BV, i_s),
-            (BV, BS),
-            (0, 1),
-        )
+        for i_s in range(base_t_block_start, base_t_block_end, BS):
+            p_k = tl.make_block_ptr(
+                k + (i_n * T_kv * H + i_h) * K,
+                (K, T_kv),
+                (1, H * K),
+                (0, i_s),
+                (BK, BS),
+                (0, 1),
+            )
+            p_v = tl.make_block_ptr(
+                v + (i_n * T_kv * H + i_h) * V,
+                (V, T_kv),
+                (1, H * V),
+                (i_v * BV, i_s),
+                (BV, BS),
+                (0, 1),
+            )
 
-        o_k = i_s + tl.arange(0, BS)
-        m_k = o_k < T_kv
+            o_k = i_s + tl.arange(0, BS)
+            m_k = o_k < T_kv
 
-        b_k = tl.load(p_k, boundary_check=(0, 1))
-        b_v = tl.load(p_v, boundary_check=(0, 1))
+            b_k = tl.load(p_k, boundary_check=(0, 1))
+            b_v = tl.load(p_v, boundary_check=(0, 1))
 
-        b_s = tl.dot(b_q, b_k) * scale * RCP_LN2
-        if USE_G:
+            b_s = tl.dot(b_q, b_k) * scale * RCP_LN2
+            if USE_G:
 
-            b_gk = tl.load(
-                g_cumsum + (i_n * T_kv + o_k) * HQ + i_hq, mask=m_k, other=0
-            ).to(tl.float32)
-            b_s += b_gq[:, None] - b_gk[None, :]
+                b_gk = tl.load(
+                    g_cumsum + (i_n * T_kv + o_k) * HQ + i_hq, mask=m_k, other=0
+                ).to(tl.float32)
+                b_s += b_gq[:, None] - b_gk[None, :]
 
-        causal_mask = (o_q_base[:, None] >= o_k[None, :]) & m_k[None, :]
-        b_p = tl.where(causal_mask, exp2(b_s - b_lse[:, None]), 0)
+            causal_mask = (o_q_base[:, None] >= o_k[None, :]) & m_k[None, :]
+            b_p = tl.where(causal_mask, exp2(b_s - b_lse[:, None]), 0)
 
-        b_dp = tl.dot(b_do, b_v)
-        b_ds = b_p * (b_dp.to(tl.float32) - b_delta[:, None])
-        b_dq += tl.dot(b_ds.to(b_k.dtype), tl.trans(b_k))
-        if USE_G:
-            b_dg += tl.sum(b_ds, 1)
+            b_dp = tl.dot(b_do, b_v)
+            b_ds = b_p * (b_dp.to(tl.float32) - b_delta[:, None])
+            b_dq += tl.dot(b_ds.to(b_k.dtype), tl.trans(b_k))
+            if USE_G:
+                b_dg += tl.sum(b_ds, 1)
+    else:
+        for i_s in range(0, T_kv, BS):
+            p_k = tl.make_block_ptr(
+                k + (i_n * T_kv * H + i_h) * K,
+                (K, T_kv),
+                (1, H * K),
+                (0, i_s),
+                (BK, BS),
+                (0, 1),
+            )
+
+            p_v = tl.make_block_ptr(
+                v + (i_n * T_kv * H + i_h) * V,
+                (V, T_kv),
+                (1, H * V),
+                (i_v * BV, i_s),
+                (BV, BS),
+                (0, 1),
+            )
+
+            o_k = i_s + tl.arange(0, BS)
+            m_k = o_k < T_kv
+
+            b_k = tl.load(p_k, boundary_check=(0, 1))
+            b_v = tl.load(p_v, boundary_check=(0, 1))
+
+            b_s = tl.dot(b_q, b_k) * scale * RCP_LN2
+            if USE_G:
+                b_gk = tl.load(
+                    g_cumsum + (i_n * T_kv + o_k) * HQ + i_hq, mask=m_k, other=0
+                ).to(tl.float32)
+                b_s += b_gq[:, None] - b_gk[None, :]
+
+            b_p = tl.where(m_k[None, :], exp2(b_s - b_lse[:, None]), 0)
+
+            b_dp = tl.dot(b_do, b_v)
+            b_ds = b_p * (b_dp.to(tl.float32) - b_delta[:, None])
+
+            b_dq += tl.dot(b_ds.to(b_k.dtype), tl.trans(b_k))
+            if USE_G:
+                b_dg += tl.sum(b_ds, 1)
 
     if USE_DEPTH:
 
@@ -808,6 +897,7 @@ def parallel_attn_bwd_kernel_dkv_group_parallel(
     BK: tl.constexpr,
     BV: tl.constexpr,
     IS_VARLEN: tl.constexpr,
+    IS_CAUSAL: tl.constexpr,
 ):
 
     i_v, i_t, i_bhg = tl.program_id(0), tl.program_id(1), tl.program_id(2)
@@ -858,7 +948,11 @@ def parallel_attn_bwd_kernel_dkv_group_parallel(
     b_dk = tl.zeros([BT, BK], dtype=tl.float32)
     b_dv = tl.zeros([BT, BV], dtype=tl.float32)
 
-    for base_start in range(k_start, T_kv, BS):
+    q_col_mask = tl.arange(0, BK)[None, :] < K
+    do_col_mask = (i_v * BV + tl.arange(0, BV)[None, :]) < V
+
+    query_base_start = k_start if IS_CAUSAL else 0
+    for base_start in range(query_base_start, T_kv, BS):
         o_base = base_start + tl.arange(0, BS)
         full_base = (base_start + BS) <= T_kv
 
@@ -883,23 +977,29 @@ def parallel_attn_bwd_kernel_dkv_group_parallel(
         delta_ptrs = delta + bos_q * HQ + i_hq + o_q * HQ
 
         if full_base:
-            b_q = tl.load(q_ptrs)
-            b_do = tl.load(do_ptrs)
+            b_q = tl.load(q_ptrs, mask=q_col_mask, other=0.0)
+            b_do = tl.load(do_ptrs, mask=do_col_mask, other=0.0)
             b_lse = tl.load(lse_ptrs)
             b_delta = tl.load(delta_ptrs)
 
             b_s = tl.dot(b_k, tl.trans(b_q)) * scale * RCP_LN2
-            causal = (o_k[:, None] <= o_base[None, :]) & m_k[:, None]
-            b_p = tl.where(causal, exp2(b_s - b_lse[None, :]), 0)
+            if IS_CAUSAL:
+                p_mask = (o_k[:, None] <= o_base[None, :]) & m_k[:, None]
+            else:
+                p_mask = m_k[:, None] & tl.full([BS], True, tl.int1)[None, :]
+            b_p = tl.where(p_mask, exp2(b_s - b_lse[None, :]), 0)
         else:
-            b_q = tl.load(q_ptrs, mask=m_q[:, None], other=0.0)
-            b_do = tl.load(do_ptrs, mask=m_q[:, None], other=0.0)
+            b_q = tl.load(q_ptrs, mask=m_q[:, None] & q_col_mask, other=0.0)
+            b_do = tl.load(do_ptrs, mask=m_q[:, None] & do_col_mask, other=0.0)
             b_lse = tl.load(lse_ptrs, mask=m_q, other=float("inf"))
             b_delta = tl.load(delta_ptrs, mask=m_q, other=0.0)
 
             b_s = tl.dot(b_k, tl.trans(b_q)) * scale * RCP_LN2
-            causal = (o_k[:, None] <= o_base[None, :]) & m_k[:, None] & m_q[None, :]
-            b_p = tl.where(causal, exp2(b_s - b_lse[None, :]), 0)
+            if IS_CAUSAL:
+                p_mask = (o_k[:, None] <= o_base[None, :]) & m_k[:, None] & m_q[None, :]
+            else:
+                p_mask = m_k[:, None] & m_q[None, :]
+            b_p = tl.where(p_mask, exp2(b_s - b_lse[None, :]), 0)
 
         b_dv += tl.dot(b_p.to(b_do.dtype), b_do)
 
@@ -967,6 +1067,7 @@ def parallel_attn_bwd_kernel_dkv(
     BV: tl.constexpr,
     USE_G: tl.constexpr,
     IS_VARLEN: tl.constexpr,
+    IS_CAUSAL: tl.constexpr,
 ):
 
     i_v, i_t, i_bh = tl.program_id(0), tl.program_id(1), tl.program_id(2)
@@ -1036,57 +1137,62 @@ def parallel_attn_bwd_kernel_dkv(
     o_k = key_tile_index * BT + tl.arange(0, BT)
     m_k = o_k < T_kv
 
-    q_partial_start = (key_tile_index * BT) * moda_group_num
-    q_partial_end = tl.minimum(((key_tile_index + 1) * BT) * moda_group_num, T_q)
+    if IS_CAUSAL:
+        q_partial_start = (key_tile_index * BT) * moda_group_num
+        q_partial_end = tl.minimum(((key_tile_index + 1) * BT) * moda_group_num, T_q)
 
-    for qs in range(q_partial_start, q_partial_end, BS):
-        o_q = qs + tl.arange(0, BS)
-        m_q = o_q < q_partial_end
-        m_q = m_q & (o_q < T_q)
+        for qs in range(q_partial_start, q_partial_end, BS):
+            o_q = qs + tl.arange(0, BS)
+            m_q = o_q < q_partial_end
+            m_q = m_q & (o_q < T_q)
 
-        p_q = tl.make_block_ptr(
-            q + (bos_q * HQ + i_hq) * K,
-            (T_q, K),
-            (HQ * K, 1),
-            (qs, 0),
-            (BS, BK),
-            (1, 0),
-        )
-        p_do = tl.make_block_ptr(
-            do + (bos_q * HQ + i_hq) * V,
-            (T_q, V),
-            (HQ * V, 1),
-            (qs, i_v * BV),
-            (BS, BV),
-            (1, 0),
-        )
-        p_lse = tl.make_block_ptr(
-            lse + bos_q * HQ + i_hq, (T_q,), (HQ,), (qs,), (BS,), (0,)
-        )
-        p_delta = tl.make_block_ptr(
-            delta + bos_q * HQ + i_hq, (T_q,), (HQ,), (qs,), (BS,), (0,)
-        )
+            p_q = tl.make_block_ptr(
+                q + (bos_q * HQ + i_hq) * K,
+                (T_q, K),
+                (HQ * K, 1),
+                (qs, 0),
+                (BS, BK),
+                (1, 0),
+            )
+            p_do = tl.make_block_ptr(
+                do + (bos_q * HQ + i_hq) * V,
+                (T_q, V),
+                (HQ * V, 1),
+                (qs, i_v * BV),
+                (BS, BV),
+                (1, 0),
+            )
+            p_lse = tl.make_block_ptr(
+                lse + bos_q * HQ + i_hq, (T_q,), (HQ,), (qs,), (BS,), (0,)
+            )
+            p_delta = tl.make_block_ptr(
+                delta + bos_q * HQ + i_hq, (T_q,), (HQ,), (qs,), (BS,), (0,)
+            )
 
-        b_q = tl.load(p_q, boundary_check=(0, 1))
-        b_do = tl.load(p_do, boundary_check=(0, 1))
-        b_lse = tl.load(p_lse, boundary_check=(0,))
-        b_delta = tl.load(p_delta, boundary_check=(0,))
+            b_q = tl.load(p_q, boundary_check=(0, 1))
+            b_do = tl.load(p_do, boundary_check=(0, 1))
+            b_lse = tl.load(p_lse, boundary_check=(0,))
+            b_delta = tl.load(p_delta, boundary_check=(0,))
 
-        o_q_base = o_q // moda_group_num
+            o_q_base = o_q // moda_group_num
 
-        b_s = tl.dot(b_k, tl.trans(b_q)) * scale * RCP_LN2
+            b_s = tl.dot(b_k, tl.trans(b_q)) * scale * RCP_LN2
 
-        causal = (o_k[:, None] <= o_q_base[None, :]) & m_k[:, None] & m_q[None, :]
-        b_p = tl.where(causal, exp2(b_s - b_lse[None, :]), 0)
+            causal = (o_k[:, None] <= o_q_base[None, :]) & m_k[:, None] & m_q[None, :]
+            b_p = tl.where(causal, exp2(b_s - b_lse[None, :]), 0)
 
-        b_dv += tl.dot(b_p.to(b_do.dtype), b_do)
+            b_dv += tl.dot(b_p.to(b_do.dtype), b_do)
 
-        b_dp = tl.dot(b_v, tl.trans(b_do))
-        b_ds = b_p * (b_dp - b_delta[None, :])
+            b_dp = tl.dot(b_v, tl.trans(b_do))
+            b_ds = b_p * (b_dp - b_delta[None, :])
 
-        b_dk += tl.dot(b_ds.to(b_q.dtype), b_q)
+            b_dk += tl.dot(b_ds.to(b_q.dtype), b_q)
 
-    for qs in range(q_partial_end, tl.cdiv(T_q, BS) * BS, BS):
+        q_full_start = q_partial_end
+    else:
+        q_full_start = 0
+
+    for qs in range(q_full_start, tl.cdiv(T_q, BS) * BS, BS):
         o_q = qs + tl.arange(0, BS)
         m_q = o_q < T_q
 
@@ -1240,7 +1346,6 @@ def parallel_attn_bwd_kernel_dkv_depth(
 
     base_k_cached = cached_k + (bos_cached * H + i_h) * K
     base_v_cached = cached_v + (bos_cached * H + i_h) * V
-
     for depth_col_start in range(depth_block_start, depth_block_end, BS):
 
         p_k_depth = tl.make_block_ptr(
@@ -1320,16 +1425,26 @@ def parallel_attn_bwd_kernel_dkv_depth(
             depth_ids = depth_col_ids
             valid_rows = depth_ids < depth_block_end
 
-            k_idx = tl.arange(0, K)[None, :]
+            k_idx = tl.arange(0, BK)[None, :]
             dk_row_offsets = ((bos_cached + depth_ids) * HQ + i_hq) * K
             dk_ptrs = d_cached_k + dk_row_offsets[:, None] + k_idx
+            dk_mask = valid_rows[:, None] & (k_idx < K)
 
-            tl.store(dk_ptrs, b_dk_depth.to(b_k_depth.dtype), mask=valid_rows[:, None])
+            tl.store(
+                dk_ptrs,
+                b_dk_depth.to(d_cached_k.dtype.element_ty),
+                mask=dk_mask,
+            )
 
-            v_idx = tl.arange(0, V)[None, :]
+            v_idx = tl.arange(0, BV)[None, :]
             dv_row_offsets = ((bos_cached + depth_ids) * HQ + i_hq) * V
             dv_ptrs = d_cached_v + dv_row_offsets[:, None] + v_idx
-            tl.store(dv_ptrs, b_dv_depth.to(b_v_depth.dtype), mask=valid_rows[:, None])
+            dv_mask = valid_rows[:, None] & (v_idx < V)
+            tl.store(
+                dv_ptrs,
+                b_dv_depth.to(d_cached_v.dtype.element_ty),
+                mask=dv_mask,
+            )
 
 
 def parallel_moda_bwd_preprocess(o: torch.Tensor, do: torch.Tensor):
@@ -1359,6 +1474,7 @@ def parallel_moda_bwd(
     cached_k: Optional[torch.Tensor] = None,
     cached_v: Optional[torch.Tensor] = None,
     moda_group_num: int = 1,
+    is_causal: bool = True,
     customized_BT: int = None,
     customized_BS: int = None,
     customized_BK: int = None,
@@ -1553,6 +1669,7 @@ def parallel_moda_bwd(
         BS=BS,
         BK=BK,
         BV=BV,
+        IS_CAUSAL=is_causal,
         num_warps=num_warps,
     )
 
@@ -1613,6 +1730,7 @@ def parallel_moda_bwd(
             BS=BS_GROUP,
             BK=BK,
             BV=BV,
+            IS_CAUSAL=is_causal,
             num_warps=NUM_WARPS_GROUP,
         )
 
@@ -1650,6 +1768,7 @@ def parallel_moda_bwd(
             BS=BS,
             BK=BK,
             BV=BV,
+            IS_CAUSAL=is_causal,
             num_warps=num_warps,
         )
 
@@ -1709,12 +1828,17 @@ def parallel_moda_bwd(
     return dq, dk, dv, dg_cumsum, d_cached_k, d_cached_v
 
 
+def _ref_seq_kv_limit(base_t: int, T_kv: int, is_causal: bool) -> int:
+    return base_t + 1 if is_causal else T_kv
+
+
 def naive_causal_ref(
     q: torch.Tensor,
     k: torch.Tensor,
     v: torch.Tensor,
     scale: Optional[float] = None,
     moda_group_num: int = 1,
+    is_causal: bool = True,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     assert (
         q.ndim == 4 and k.ndim == 4 and v.ndim == 4
@@ -1747,11 +1871,12 @@ def naive_causal_ref(
             v_bh = v[b, :, h].to(torch.float32)
             for t_q_idx in range(T_q):
                 base_t = t_q_idx // moda_group_num
+                seq_kv_end = _ref_seq_kv_limit(base_t, T_kv, is_causal)
 
-                scores = (q_bh[t_q_idx] @ k_bh[: base_t + 1].T) * scale
+                scores = (q_bh[t_q_idx] @ k_bh[:seq_kv_end].T) * scale
 
                 w = torch.softmax(scores, dim=0)
-                ctx = (w.unsqueeze(1) * v_bh[: base_t + 1]).sum(0)
+                ctx = (w.unsqueeze(1) * v_bh[:seq_kv_end]).sum(0)
                 out[b, t_q_idx, h] = ctx
                 lse[b, t_q_idx, h] = torch.logsumexp(scores, dim=0) / ln2
 
@@ -1766,6 +1891,7 @@ def naive_mixture_of_depth_causal_ref(
     vd: Optional[torch.Tensor] = None,
     scale: Optional[float] = None,
     moda_group_num: int = 1,
+    is_causal: bool = True,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     assert (
         q.ndim == 4 and k.ndim == 4 and v.ndim == 4
@@ -1824,8 +1950,9 @@ def naive_mixture_of_depth_causal_ref(
             for t_q_idx in range(T_q):
                 q_vec = q_bh[t_q_idx]
                 base_t = t_q_idx // moda_group_num
+                seq_kv_end = _ref_seq_kv_limit(base_t, T_kv, is_causal)
 
-                logits_space = (q_vec @ k_bh[: base_t + 1].T) * scale
+                logits_space = (q_vec @ k_bh[:seq_kv_end].T) * scale
 
                 if use_depth:
 
@@ -1837,13 +1964,13 @@ def naive_mixture_of_depth_causal_ref(
                 w = torch.softmax(logits, dim=0)
 
                 if use_depth:
-                    w_space = w[: base_t + 1]
-                    w_depth = w[base_t + 1 :]
-                    ctx_space = (w_space.unsqueeze(1) * v_bh[: base_t + 1]).sum(0)
+                    w_space = w[:seq_kv_end]
+                    w_depth = w[seq_kv_end:]
+                    ctx_space = (w_space.unsqueeze(1) * v_bh[:seq_kv_end]).sum(0)
                     ctx_depth = (w_depth.unsqueeze(1) * vd_bh[base_t]).sum(0)
                     out[b, t_q_idx, h] = ctx_space + ctx_depth
                 else:
-                    out[b, t_q_idx, h] = (w.unsqueeze(1) * v_bh[: base_t + 1]).sum(0)
+                    out[b, t_q_idx, h] = (w.unsqueeze(1) * v_bh[:seq_kv_end]).sum(0)
 
                 lse[b, t_q_idx, h] = torch.logsumexp(logits, dim=0) / ln2
 
@@ -1858,6 +1985,7 @@ def naive_mixture_of_depth_causal_ref_vis(
     vd: Optional[torch.Tensor] = None,
     scale: Optional[float] = None,
     moda_group_num: int = 1,
+    is_causal: bool = True,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     assert (
         q.ndim == 4 and k.ndim == 4 and v.ndim == 4
@@ -1919,8 +2047,9 @@ def naive_mixture_of_depth_causal_ref_vis(
             for t_q_idx in range(T_q):
                 q_vec = q_bh[t_q_idx]
                 base_t = t_q_idx // moda_group_num
+                seq_kv_end = _ref_seq_kv_limit(base_t, T_kv, is_causal)
 
-                logits_space = (q_vec @ k_bh[: base_t + 1].T) * scale
+                logits_space = (q_vec @ k_bh[:seq_kv_end].T) * scale
 
                 if use_depth:
 
@@ -1937,13 +2066,13 @@ def naive_mixture_of_depth_causal_ref_vis(
                 attn[b, h, t_q_idx, T_kv : T_kv + len(w_depth)] = w_depth
 
                 if use_depth:
-                    w_space = w[: base_t + 1]
-                    w_depth = w[base_t + 1 :]
-                    ctx_space = (w_space.unsqueeze(1) * v_bh[: base_t + 1]).sum(0)
+                    w_space = w[:seq_kv_end]
+                    w_depth = w[seq_kv_end:]
+                    ctx_space = (w_space.unsqueeze(1) * v_bh[:seq_kv_end]).sum(0)
                     ctx_depth = (w_depth.unsqueeze(1) * vd_bh[base_t]).sum(0)
                     out[b, t_q_idx, h] = ctx_space + ctx_depth
                 else:
-                    out[b, t_q_idx, h] = (w.unsqueeze(1) * v_bh[: base_t + 1]).sum(0)
+                    out[b, t_q_idx, h] = (w.unsqueeze(1) * v_bh[:seq_kv_end]).sum(0)
 
                 lse[b, t_q_idx, h] = torch.logsumexp(logits, dim=0) / ln2
 
@@ -1983,10 +2112,11 @@ def test_once(
     device="cuda",
     L: int = 64,
     moda_group_num: int = 1,
+    is_causal: bool = True,
 ):
     torch.manual_seed(seed)
     print(
-        f"\n==== Test B={B} T={T} H={H} K={K} V={V} L={L} dtype={dtype} moda_group_num={moda_group_num} ===="
+        f"\n==== Test B={B} T={T} H={H} K={K} V={V} L={L} dtype={dtype} moda_group_num={moda_group_num} is_causal={is_causal} ===="
     )
 
     TQ = T * moda_group_num
@@ -2007,7 +2137,14 @@ def test_once(
         vd = None
 
     ref_out, ref_lse = naive_mixture_of_depth_causal_ref(
-        q, k, v, kd=kd, vd=vd, scale=scale, moda_group_num=moda_group_num
+        q,
+        k,
+        v,
+        kd=kd,
+        vd=vd,
+        scale=scale,
+        moda_group_num=moda_group_num,
+        is_causal=is_causal,
     )
 
     out_impl, lse_impl = parallel_moda_fwd(
@@ -2020,6 +2157,7 @@ def test_once(
         cached_k=kd,
         cached_v=vd,
         moda_group_num=moda_group_num,
+        is_causal=is_causal,
     )
 
     out_impl_f32 = out_impl.float()
@@ -2034,18 +2172,20 @@ def test_once(
 def main_basic_accuracy():
     device = "cuda"
 
-    test_once(
-        B=1,
-        T=4096 * 8,
-        H=4,
-        K=64,
-        V=64,
-        L=64,
-        dtype=torch.float16,
-        seed=2,
-        device=device,
-        moda_group_num=2,
-    )
+    for is_causal in (True, False):
+        test_once(
+            B=1,
+            T=4096 * 8,
+            H=4,
+            K=64,
+            V=64,
+            L=64,
+            dtype=torch.float16,
+            seed=2,
+            device=device,
+            moda_group_num=2,
+            is_causal=is_causal,
+        )
 
 
 def main_speed_benchmark():
@@ -2085,62 +2225,82 @@ def main_speed_benchmark():
         print(f"{name}: {avg_time:.3f} ms")
         return avg_time
 
-    def modav14p0_spatial_only_test():
-        return parallel_moda_fwd(
-            q,
-            k,
-            v,
-            g_cumsum=None,
-            scale=scale,
-            cu_seqlens=None,
-            cached_k=None,
-            cached_v=None,
-            moda_group_num=moda_group_num,
+    for is_causal in (True, False):
+        print(f"\n---- Benchmark is_causal={is_causal} ----")
+
+        def modav14p0_spatial_only_test():
+            return parallel_moda_fwd(
+                q,
+                k,
+                v,
+                g_cumsum=None,
+                scale=scale,
+                cu_seqlens=None,
+                cached_k=None,
+                cached_v=None,
+                moda_group_num=moda_group_num,
+                is_causal=is_causal,
+            )
+
+        def modav14p0_triton_test():
+            return parallel_moda_fwd(
+                q,
+                k,
+                v,
+                g_cumsum=None,
+                scale=scale,
+                cu_seqlens=None,
+                cached_k=kd,
+                cached_v=vd,
+                moda_group_num=moda_group_num,
+                is_causal=is_causal,
+            )
+
+        modav14p0_time = benchmark(
+            modav14p0_triton_test, "MoDA v14.0 Triton Implementation"
+        )
+        modav14p0_spatial_only_time = benchmark(
+            modav14p0_spatial_only_test, "Flash Attention (spatial only)"
         )
 
-    def modav14p0_triton_test():
-        return parallel_moda_fwd(
-            q,
-            k,
-            v,
-            g_cumsum=None,
-            scale=scale,
-            cu_seqlens=None,
-            cached_k=kd,
-            cached_v=vd,
-            moda_group_num=moda_group_num,
-        )
-
-    modav14p0_time = benchmark(
-        modav14p0_triton_test, "MoDA v14.0 Triton Implementation"
-    )
-    modav14p0_spatial_only_time = benchmark(
-        modav14p0_spatial_only_test, "Flash Attention (spatial only)"
-    )
-
-    print(f"MoDA v14.0 Triton: {modav14p0_time:.3f} ms")
-    print(f"Flash Attention V2 (spatial only): {modav14p0_spatial_only_time:.3f} ms")
+        print(f"MoDA v14.0 Triton: {modav14p0_time:.3f} ms")
+        print(f"Flash Attention V2 (spatial only): {modav14p0_spatial_only_time:.3f} ms")
 
 
-def causal_attn_ref(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, scale: float):
+def causal_attn_ref(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    scale: float,
+    is_causal: bool = True,
+):
     B, T, H, K = q.shape
     q_ = q.permute(0, 2, 1, 3)
     k_ = k.permute(0, 2, 1, 3)
     v_ = v.permute(0, 2, 1, 3)
     scores = torch.matmul(q_, k_.transpose(-1, -2)) * scale
-    causal_mask = torch.triu(torch.ones(T, T, device=q.device, dtype=torch.bool), 1)
-    scores.masked_fill_(causal_mask, float("-inf"))
+    if is_causal:
+        causal_mask = torch.triu(torch.ones(T, T, device=q.device, dtype=torch.bool), 1)
+        scores.masked_fill_(causal_mask, float("-inf"))
     attn = torch.softmax(scores, dim=-1)
     out = torch.matmul(attn, v_)
     return out.permute(0, 2, 1, 3)
 
 
 def test_dq_backward(
-    B=2, T=32, H=4, K=64, V=64, dtype=torch.float32, seed=0, device="cuda"
+    B=2,
+    T=32,
+    H=4,
+    K=64,
+    V=64,
+    dtype=torch.float32,
+    seed=0,
+    device="cuda",
+    is_causal: bool = True,
 ):
     torch.manual_seed(seed)
     print(
-        f"\n==== DQ TEST (NO DEPTH, moda_group_num=1) B={B} T={T} H={H} K={K} V={V} dtype={dtype} ===="
+        f"\n==== DQ TEST (NO DEPTH, moda_group_num=1) B={B} T={T} H={H} K={K} V={V} dtype={dtype} is_causal={is_causal} ===="
     )
     scale = 1.0 / math.sqrt(K)
 
@@ -2159,6 +2319,7 @@ def test_dq_backward(
             cached_k=None,
             cached_v=None,
             moda_group_num=1,
+            is_causal=is_causal,
         )
 
     do = torch.randn_like(o_kernel)
@@ -2177,6 +2338,7 @@ def test_dq_backward(
             cached_k=None,
             cached_v=None,
             moda_group_num=1,
+            is_causal=is_causal,
         )
 
     q_ref = q.clone().detach().requires_grad_(True)
@@ -2184,7 +2346,14 @@ def test_dq_backward(
     v_ref = v.clone().detach()
 
     out_ref, _ = naive_mixture_of_depth_causal_ref(
-        q_ref, k_ref, v_ref, kd=None, vd=None, scale=scale, moda_group_num=1
+        q_ref,
+        k_ref,
+        v_ref,
+        kd=None,
+        vd=None,
+        scale=scale,
+        moda_group_num=1,
+        is_causal=is_causal,
     )
     loss = (out_ref * do).sum()
     loss.backward()
@@ -2204,10 +2373,11 @@ def test_dkv_backward(
     device="cuda",
     seed=0,
     moda_group_num=1,
+    is_causal: bool = True,
 ):
     torch.manual_seed(seed)
     print(
-        f"\n==== DKV TEST (NO DEPTH, moda_group_num={moda_group_num}) B={B} T={T} H={H} K={K} V={V} dtype={dtype} ===="
+        f"\n==== DKV TEST (NO DEPTH, moda_group_num={moda_group_num}) B={B} T={T} H={H} K={K} V={V} dtype={dtype} is_causal={is_causal} ===="
     )
     scale = 1.0 / math.sqrt(K)
 
@@ -2231,6 +2401,7 @@ def test_dkv_backward(
             cached_k=None,
             cached_v=None,
             moda_group_num=moda_group_num,
+            is_causal=is_causal,
         )
 
     do = torch.randn_like(o_kernel)
@@ -2249,6 +2420,7 @@ def test_dkv_backward(
             cached_k=None,
             cached_v=None,
             moda_group_num=moda_group_num,
+            is_causal=is_causal,
         )
 
     q_ref = q.detach().clone().requires_grad_(True)
@@ -2263,6 +2435,7 @@ def test_dkv_backward(
         vd=None,
         scale=scale,
         moda_group_num=moda_group_num,
+        is_causal=is_causal,
     )
     loss = (out_ref * do).sum()
     loss.backward()
@@ -2286,10 +2459,11 @@ def test_dkv_backward_depth(
     dtype=torch.float16,
     device="cuda",
     seed=0,
+    is_causal: bool = True,
 ):
     torch.manual_seed(seed)
     print(
-        f"\n==== DKV DEPTH TEST B={B} T_kv={T_kv} H={H} K={K} V={V} L={L} moda_group_num={moda_group_num} dtype={dtype} ===="
+        f"\n==== DKV DEPTH TEST B={B} T_kv={T_kv} H={H} K={K} V={V} L={L} moda_group_num={moda_group_num} dtype={dtype} is_causal={is_causal} ===="
     )
     T_q = T_kv * moda_group_num
     scale = 1.0 / math.sqrt(K)
@@ -2313,6 +2487,7 @@ def test_dkv_backward_depth(
             cached_k=kd,
             cached_v=vd,
             moda_group_num=moda_group_num,
+            is_causal=is_causal,
         )
     do = torch.randn_like(o_kernel)
     with torch.no_grad():
@@ -2329,6 +2504,7 @@ def test_dkv_backward_depth(
             cached_k=kd,
             cached_v=vd,
             moda_group_num=moda_group_num,
+            is_causal=is_causal,
         )
     q_ref = q.detach().clone().requires_grad_(True)
     k_ref = k.detach().clone().requires_grad_(True)
@@ -2343,6 +2519,7 @@ def test_dkv_backward_depth(
         vd=vd_ref,
         scale=scale,
         moda_group_num=moda_group_num,
+        is_causal=is_causal,
     )
     loss = (out_ref * do).sum()
     loss.backward()
@@ -2366,9 +2543,10 @@ def test_dq_backward_depth(
     dtype=torch.float16,
     device="cuda",
     seed=0,
+    is_causal: bool = True,
 ):
     print(
-        f"\n==== DQ TEST (WITH DEPTH, moda_group_num={moda_group_num}) B={B} T_kv={T_kv} H={H} K={K} V={V} L={L} dtype={dtype} ===="
+        f"\n==== DQ TEST (WITH DEPTH, moda_group_num={moda_group_num}) B={B} T_kv={T_kv} H={H} K={K} V={V} L={L} dtype={dtype} is_causal={is_causal} ===="
     )
     torch.manual_seed(seed)
     T_q = T_kv * moda_group_num
@@ -2395,6 +2573,7 @@ def test_dq_backward_depth(
             cached_k=kd,
             cached_v=vd,
             moda_group_num=moda_group_num,
+            is_causal=is_causal,
         )
 
     do = torch.randn_like(o)
@@ -2412,6 +2591,7 @@ def test_dq_backward_depth(
             cached_k=kd,
             cached_v=vd,
             moda_group_num=moda_group_num,
+            is_causal=is_causal,
         )
 
     q_ref = q.detach().clone().requires_grad_(True)
@@ -2427,6 +2607,7 @@ def test_dq_backward_depth(
         vd=vd_ref,
         scale=scale,
         moda_group_num=moda_group_num,
+        is_causal=is_causal,
     )
     loss = (out_ref * do).sum()
     loss.backward()
@@ -2435,11 +2616,17 @@ def test_dq_backward_depth(
 
 
 def main_dq_accuracy():
-    test_dq_backward(B=2, T=4096, H=4, K=64, V=64, dtype=torch.float16)
+    for is_causal in (True, False):
+        test_dq_backward(
+            B=2, T=4096, H=4, K=64, V=64, dtype=torch.float16, is_causal=is_causal
+        )
 
 
 def main_dkv_accuracy():
-    test_dkv_backward(B=2, T=4096, H=4, K=64, V=64, dtype=torch.float16)
+    for is_causal in (True, False):
+        test_dkv_backward(
+            B=2, T=4096, H=4, K=64, V=64, dtype=torch.float16, is_causal=is_causal
+        )
 
 
 RCP_LN2_CONST: float = 1.4426950216
@@ -2461,6 +2648,7 @@ class ParallelMixtureOfDepthAttentionFunction(torch.autograd.Function):
         cached_k: Optional[torch.Tensor] = None,
         cached_v: Optional[torch.Tensor] = None,
         moda_group_num: int = 1,
+        is_causal: bool = True,
         group_bs: Optional[int] = None,
         group_warps: Optional[int] = None,
         depth_bs: Optional[int] = None,
@@ -2487,6 +2675,7 @@ class ParallelMixtureOfDepthAttentionFunction(torch.autograd.Function):
             cached_k=cached_k,
             cached_v=cached_v,
             moda_group_num=moda_group_num,
+            is_causal=is_causal,
         )
 
         ctx.save_for_backward(
@@ -2507,6 +2696,7 @@ class ParallelMixtureOfDepthAttentionFunction(torch.autograd.Function):
         ctx.scale = scale
         ctx.cu_seqlens = cu_seqlens
         ctx.moda_group_num = moda_group_num
+        ctx.is_causal = is_causal
         ctx.has_g = g is not None
         ctx.dtype = q.dtype
 
@@ -2541,6 +2731,7 @@ class ParallelMixtureOfDepthAttentionFunction(torch.autograd.Function):
             cached_k=cached_k,
             cached_v=cached_v,
             moda_group_num=ctx.moda_group_num,
+            is_causal=ctx.is_causal,
             group_bs=ctx.group_bs,
             group_warps=ctx.group_warps,
             depth_bs=ctx.depth_bs,
@@ -2556,6 +2747,7 @@ class ParallelMixtureOfDepthAttentionFunction(torch.autograd.Function):
         d_scale = None
         d_cu = None
         d_moda = None
+        d_is_causal = None
         d_group_bs = None
         d_group_warps = None
         d_depth_bs = None
@@ -2575,6 +2767,7 @@ class ParallelMixtureOfDepthAttentionFunction(torch.autograd.Function):
             d_cached_k,
             d_cached_v,
             d_moda,
+            d_is_causal,
             d_group_bs,
             d_group_warps,
             d_depth_bs,
@@ -2592,6 +2785,7 @@ def parallel_moda(
     scale: Optional[float] = None,
     cu_seqlens: Optional[torch.LongTensor] = None,
     moda_group_num: int = 1,
+    is_causal: bool = True,
     head_first: bool = False,
     need_lse: bool = False,
     return_depth_grads: bool = True,
@@ -2666,6 +2860,7 @@ def parallel_moda(
         cached_k,
         cached_v,
         moda_group_num,
+        is_causal,
         group_bs,
         group_warps,
         depth_bs,
@@ -2701,12 +2896,13 @@ def run_case(
     device="cuda",
     dtype=torch.float32,
     seed=0,
+    is_causal: bool = True,
 ):
     torch.manual_seed(seed)
     T_q = T_kv * moda_group_num
     print(f"\n=== {case_name} ===")
     print(
-        f"B={B}, T_kv={T_kv}, T_q={T_q}, H={H}, K={K}, V={V}, L={L}, group={moda_group_num}, dtype={dtype}"
+        f"B={B}, T_kv={T_kv}, T_q={T_q}, H={H}, K={K}, V={V}, L={L}, group={moda_group_num}, dtype={dtype}, is_causal={is_causal}"
     )
 
     q = torch.randn(B, T_q, H, K, device=device, dtype=dtype, requires_grad=True)
@@ -2745,6 +2941,7 @@ def run_case(
         scale=scale,
         cu_seqlens=None,
         moda_group_num=moda_group_num,
+        is_causal=is_causal,
         head_first=False,
         need_lse=False,
     )
@@ -2770,6 +2967,7 @@ def run_case(
         vd=vd_ref,
         scale=scale,
         moda_group_num=moda_group_num,
+        is_causal=is_causal,
     )
     loss_ref = (out_ref * grad_out).sum()
     loss_ref.backward()
@@ -2801,6 +2999,7 @@ def run_one_case(
     fixed_seed: int = 1234,
     customized_BT: int = None,
     customized_BS: int = None,
+    is_causal: bool = True,
 ):
     torch.manual_seed(fixed_seed)
     T_q = T_kv * group
@@ -2826,6 +3025,7 @@ def run_one_case(
             cached_k=cached_k,
             cached_v=cached_v,
             moda_group_num=group,
+            is_causal=is_causal,
             customized_BT=customized_BT,
             customized_BS=customized_BS,
         )
@@ -2847,6 +3047,7 @@ def run_one_case(
             cached_k=cached_k,
             cached_v=cached_v,
             moda_group_num=group,
+            is_causal=is_causal,
             customized_BT=customized_BT,
             customized_BS=customized_BS,
         )
@@ -2856,7 +3057,7 @@ def run_one_case(
 
     avg_ms = total_ms / repeat
     print(
-        f"{name:<28}  B={B} T_kv={T_kv} T_q={T_q} H={H} K={K} V={V} L={L} G={group}  dtype={str(dtype).replace('torch.',''):<9}  {avg_ms:7.3f} ms"
+        f"{name:<28}  B={B} T_kv={T_kv} T_q={T_q} H={H} K={K} V={V} L={L} G={group}  is_causal={str(is_causal):<5} dtype={str(dtype).replace('torch.',''):<9}  {avg_ms:7.3f} ms"
     )
     return avg_ms, T_q
 
@@ -2876,6 +3077,7 @@ def benchmark_suite(
     need_baseline_g2=True,
     customized_BT=None,
     customized_BS=None,
+    is_causal_options=(True, False),
 ):
     print("==== Depth + MoDA Forward Benchmark (minimal) ====")
     print(
@@ -2884,69 +3086,55 @@ def benchmark_suite(
 
     print("-" * 110)
 
-    for dt in dtypes:
-        print(f"\n--- DType = {str(dt).replace('torch.','')} ---")
+    for is_causal in is_causal_options:
+        print(f"\n=== is_causal={is_causal} ===")
+        for dt in dtypes:
+            print(f"\n--- DType = {str(dt).replace('torch.','')} ---")
 
-        t_case1, _ = run_one_case(
-            name="moda",
-            B=B,
-            T_kv=T_kv,
-            H=H,
-            K=K,
-            V=V,
-            L=L_depth,
-            group=1,
-            dtype=dt,
-            device=device,
-            warmup=warmup,
-            repeat=repeat,
-            customized_BT=customized_BT,
-            customized_BS=customized_BS,
-        )
+            run_one_case(
+                name="moda",
+                B=B,
+                T_kv=T_kv,
+                H=H,
+                K=K,
+                V=V,
+                L=L_depth,
+                group=1,
+                dtype=dt,
+                device=device,
+                warmup=warmup,
+                repeat=repeat,
+                customized_BT=customized_BT,
+                customized_BS=customized_BS,
+                is_causal=is_causal,
+            )
 
-        t_case2, _ = run_one_case(
-            name="fa2",
-            B=B,
-            T_kv=T_kv,
-            H=H,
-            K=K,
-            V=V,
-            L=0,
-            group=1,
-            dtype=dt,
-            device=device,
-            warmup=warmup,
-            repeat=repeat,
-            customized_BT=customized_BT,
-            customized_BS=customized_BS,
-        )
-
-        t_case3, _ = run_one_case(
-            name="moda + gqa=2",
-            B=B,
-            T_kv=T_kv,
-            H=H,
-            K=K,
-            V=V,
-            L=L_depth,
-            group=2,
-            dtype=dt,
-            device=device,
-            warmup=warmup,
-            repeat=repeat,
-            customized_BT=customized_BT,
-            customized_BS=customized_BS,
-        )
-
-        if need_baseline_g2:
-            t_base_g2, _ = run_one_case(
-                name="fa2 + gqa=2",
+            run_one_case(
+                name="fa2",
                 B=B,
                 T_kv=T_kv,
                 H=H,
                 K=K,
                 V=V,
                 L=0,
+                group=1,
+                dtype=dt,
+                device=device,
+                warmup=warmup,
+                repeat=repeat,
+                customized_BT=customized_BT,
+                customized_BS=customized_BS,
+                is_causal=is_causal,
+            )
+
+            run_one_case(
+                name="moda + gqa=2",
+                B=B,
+                T_kv=T_kv,
+                H=H,
+                K=K,
+                V=V,
+                L=L_depth,
                 group=2,
                 dtype=dt,
                 device=device,
@@ -2954,7 +3142,27 @@ def benchmark_suite(
                 repeat=repeat,
                 customized_BT=customized_BT,
                 customized_BS=customized_BS,
+                is_causal=is_causal,
             )
+
+            if need_baseline_g2:
+                run_one_case(
+                    name="fa2 + gqa=2",
+                    B=B,
+                    T_kv=T_kv,
+                    H=H,
+                    K=K,
+                    V=V,
+                    L=0,
+                    group=2,
+                    dtype=dt,
+                    device=device,
+                    warmup=warmup,
+                    repeat=repeat,
+                    customized_BT=customized_BT,
+                    customized_BS=customized_BS,
+                    is_causal=is_causal,
+                )
 
 
 def run_one_case_bwd(
@@ -2976,6 +3184,7 @@ def run_one_case_bwd(
     customized_BS: int = None,
     customized_BT_backward: int = None,
     customized_BS_backward: int = None,
+    is_causal: bool = True,
 ):
     torch.manual_seed(fixed_seed)
     T_q = T_kv * group
@@ -3001,6 +3210,7 @@ def run_one_case_bwd(
             cached_k=cached_k,
             cached_v=cached_v,
             moda_group_num=group,
+            is_causal=is_causal,
             customized_BT=customized_BT,
             customized_BS=customized_BS,
         )
@@ -3018,6 +3228,7 @@ def run_one_case_bwd(
             cached_k=cached_k,
             cached_v=cached_v,
             moda_group_num=group,
+            is_causal=is_causal,
             customized_BT=customized_BT_backward,
             customized_BS=customized_BS_backward,
         )
@@ -3038,6 +3249,7 @@ def run_one_case_bwd(
             cached_k=cached_k,
             cached_v=cached_v,
             moda_group_num=group,
+            is_causal=is_causal,
             customized_BT=customized_BT,
             customized_BS=customized_BS,
         )
@@ -3055,6 +3267,7 @@ def run_one_case_bwd(
             cached_k=cached_k,
             cached_v=cached_v,
             moda_group_num=group,
+            is_causal=is_causal,
             customized_BT=customized_BT_backward,
             customized_BS=customized_BS_backward,
         )
@@ -3065,7 +3278,7 @@ def run_one_case_bwd(
     avg_ms = total_ms / repeat
     print(
         f"[BWD] {name:<18} B={B} T_kv={T_kv} T_q={T_q} H={H} K={K} V={V} "
-        f"L={L:<4} GQA={group:<2} dtype={str(dtype).replace('torch.',''):<9} {avg_ms:7.3f} ms"
+        f"L={L:<4} GQA={group:<2} is_causal={str(is_causal):<5} dtype={str(dtype).replace('torch.',''):<9} {avg_ms:7.3f} ms"
     )
     return avg_ms, T_q
 
@@ -3087,6 +3300,7 @@ def benchmark_suite_backward(
     customized_BS=None,
     customized_BT_backward=None,
     customized_BS_backward=None,
+    is_causal_options=(True, False),
 ):
     print("==== MoDA / FA2 Backward Benchmark (Forward+Backward) ====")
     print(
@@ -3094,75 +3308,59 @@ def benchmark_suite_backward(
         f"warmup={warmup}, repeat={repeat}, customized_BT={customized_BT}, customized_BS={customized_BS}, customized_BT_backward={customized_BT_backward}, customized_BS_backward={customized_BS_backward}"
     )
     print("-" * 115)
-    for dt in dtypes:
-        print(f"\n--- DType = {str(dt).replace('torch.','')} ---")
+    for is_causal in is_causal_options:
+        print(f"\n=== is_causal={is_causal} ===")
+        for dt in dtypes:
+            print(f"\n--- DType = {str(dt).replace('torch.','')} ---")
 
-        run_one_case_bwd(
-            name="moda",
-            B=B,
-            T_kv=T_kv,
-            H=H,
-            K=K,
-            V=V,
-            L=L_depth,
-            group=1,
-            dtype=dt,
-            device=device,
-            warmup=warmup,
-            repeat=repeat,
-            customized_BT=customized_BT,
-            customized_BS=customized_BS,
-            customized_BT_backward=customized_BT_backward,
-            customized_BS_backward=customized_BS_backward,
-        )
-
-        run_one_case_bwd(
-            name="fa2",
-            B=B,
-            T_kv=T_kv,
-            H=H,
-            K=K,
-            V=V,
-            L=0,
-            group=1,
-            dtype=dt,
-            device=device,
-            warmup=warmup,
-            repeat=repeat,
-            customized_BT=customized_BT,
-            customized_BS=customized_BS,
-            customized_BT_backward=customized_BT_backward,
-            customized_BS_backward=customized_BS_backward,
-        )
-
-        run_one_case_bwd(
-            name="moda + gqa=2",
-            B=B,
-            T_kv=T_kv,
-            H=H,
-            K=K,
-            V=V,
-            L=L_depth,
-            group=2,
-            dtype=dt,
-            device=device,
-            warmup=warmup,
-            repeat=repeat,
-            customized_BT=customized_BT,
-            customized_BS=customized_BS,
-            customized_BT_backward=customized_BT_backward,
-            customized_BS_backward=customized_BS_backward,
-        )
-
-        if need_baseline_g2:
             run_one_case_bwd(
-                name="fa2 + gqa=2",
+                name="moda",
+                B=B,
+                T_kv=T_kv,
+                H=H,
+                K=K,
+                V=V,
+                L=L_depth,
+                group=1,
+                dtype=dt,
+                device=device,
+                warmup=warmup,
+                repeat=repeat,
+                customized_BT=customized_BT,
+                customized_BS=customized_BS,
+                customized_BT_backward=customized_BT_backward,
+                customized_BS_backward=customized_BS_backward,
+                is_causal=is_causal,
+            )
+
+            run_one_case_bwd(
+                name="fa2",
                 B=B,
                 T_kv=T_kv,
                 H=H,
                 K=K,
                 V=V,
                 L=0,
+                group=1,
+                dtype=dt,
+                device=device,
+                warmup=warmup,
+                repeat=repeat,
+                customized_BT=customized_BT,
+                customized_BS=customized_BS,
+                customized_BT_backward=customized_BT_backward,
+                customized_BS_backward=customized_BS_backward,
+                is_causal=is_causal,
+            )
+
+            run_one_case_bwd(
+                name="moda + gqa=2",
+                B=B,
+                T_kv=T_kv,
+                H=H,
+                K=K,
+                V=V,
+                L=L_depth,
                 group=2,
                 dtype=dt,
                 device=device,
@@ -3172,7 +3370,29 @@ def benchmark_suite_backward(
                 customized_BS=customized_BS,
                 customized_BT_backward=customized_BT_backward,
                 customized_BS_backward=customized_BS_backward,
+                is_causal=is_causal,
             )
+
+            if need_baseline_g2:
+                run_one_case_bwd(
+                    name="fa2 + gqa=2",
+                    B=B,
+                    T_kv=T_kv,
+                    H=H,
+                    K=K,
+                    V=V,
+                    L=0,
+                    group=2,
+                    dtype=dt,
+                    device=device,
+                    warmup=warmup,
+                    repeat=repeat,
+                    customized_BT=customized_BT,
+                    customized_BS=customized_BS,
+                    customized_BT_backward=customized_BT_backward,
+                    customized_BS_backward=customized_BS_backward,
+                    is_causal=is_causal,
+                )
 
 
 def _bench_fwd_only(fwd_fn, warmup=10, iters=50):
@@ -3220,7 +3440,20 @@ def _bench_fwd_bwd_timing(fwd_fn, grad_tensors, warmup=10, iters=50):
 
 
 def _run_single_method(
-    method_name, T_kv, G, B, H, K, V, L, dtype, device, mode, warmup, repeat
+    method_name,
+    T_kv,
+    G,
+    B,
+    H,
+    K,
+    V,
+    L,
+    dtype,
+    device,
+    mode,
+    warmup,
+    repeat,
+    is_causal,
 ):
     from fla.ops.attn import parallel as fa2_mod
 
@@ -3234,6 +3467,8 @@ def _run_single_method(
     v = torch.randn(B, T_kv, H, V, dtype=dtype, device=device, requires_grad=need_grad)
 
     if method_name == "FA2_ref":
+        if not is_causal:
+            raise NotImplementedError("FA2_ref benchmark only supports is_causal=True")
         q = torch.randn(
             B, T_kv, HQ, K, dtype=dtype, device=device, requires_grad=need_grad
         )
@@ -3265,6 +3500,7 @@ def _run_single_method(
                 cached_k=kd,
                 cached_v=vd,
                 moda_group_num=G,
+                is_causal=is_causal,
             )
 
         grad_tensors = [q, k, v, kd, vd]
@@ -3285,6 +3521,7 @@ def _run_single_method(
                 cached_k=None,
                 cached_v=None,
                 moda_group_num=G,
+                is_causal=is_causal,
             )
 
         grad_tensors = [q, k, v]
@@ -3299,11 +3536,40 @@ def _run_single_method(
 
 
 def comprehensive_benchmark(
-    T_kv_list, G_list, B, H, K, V, L, dtype, device, warmup, repeat, mode
+    T_kv_list,
+    G_list,
+    B,
+    H,
+    K,
+    V,
+    L,
+    dtype,
+    device,
+    warmup,
+    repeat,
+    mode,
+    is_causal_options=(True, False),
 ):
     import csv
 
-    method_names = ["FA2_ref", "MoDAv14+D", "MoDAv14"]
+    method_specs = []
+    if True in is_causal_options:
+        method_specs.extend(
+            [
+                ("FA2_ref", "FA2_ref", True),
+                ("MoDAv14+D", "MoDAv14+D", True),
+                ("MoDAv14", "MoDAv14", True),
+            ]
+        )
+    if False in is_causal_options:
+        method_specs.extend(
+            [
+                ("MoDAv14+D (non_causal)", "MoDAv14+D", False),
+                ("MoDAv14 (non_causal)", "MoDAv14", False),
+            ]
+        )
+
+    method_names = [display_name for display_name, _, _ in method_specs]
     results = []
 
     print(f"\n{'='*140}")
@@ -3314,21 +3580,26 @@ def comprehensive_benchmark(
 
     hdr = f"{'T_kv':>8} {'G':>4} {'T_q':>10}"
     for mn in method_names:
-        hdr += f" | {mn:>16}"
+        hdr += f" | {mn:>24}"
     print(hdr)
     print("-" * len(hdr))
 
     for G in G_list:
         for T_kv in T_kv_list:
             T_q = T_kv * G
-            row = {"T_kv": T_kv, "G": G, "T_q": T_q, "mode": mode}
+            row = {
+                "T_kv": T_kv,
+                "G": G,
+                "T_q": T_q,
+                "mode": mode,
+            }
             line = f"{T_kv:>8} {G:>4} {T_q:>10}"
 
-            for mn in method_names:
+            for display_name, method_name, is_causal in method_specs:
                 torch.cuda.empty_cache()
                 try:
                     ms = _run_single_method(
-                        mn,
+                        method_name,
                         T_kv,
                         G,
                         B,
@@ -3341,13 +3612,17 @@ def comprehensive_benchmark(
                         mode,
                         warmup,
                         repeat,
+                        is_causal,
                     )
-                    row[mn] = f"{ms:.3f}"
-                    line += f" | {ms:>13.3f} ms"
+                    row[display_name] = f"{ms:.3f}"
+                    line += f" | {ms:>21.3f} ms"
+                except NotImplementedError:
+                    row[display_name] = "N/A"
+                    line += f" | {'N/A':>24}"
                 except RuntimeError as e:
                     if "out of memory" in str(e):
-                        row[mn] = "OOM"
-                        line += f" | {'OOM':>16}"
+                        row[display_name] = "OOM"
+                        line += f" | {'OOM':>24}"
                         torch.cuda.empty_cache()
                     else:
                         raise
@@ -3414,6 +3689,21 @@ if __name__ == "__main__":
         device=device,
         dtype=torch.float16,
         seed=2,
+    )
+
+    run_case(
+        "Case4: depth L=64, group=2, non-causal sequence KV",
+        B=1,
+        T_kv=128,
+        H=2,
+        K=64,
+        V=64,
+        L=72,
+        moda_group_num=2,
+        device=device,
+        dtype=torch.float16,
+        seed=3,
+        is_causal=False,
     )
 
     comprehensive_benchmark(

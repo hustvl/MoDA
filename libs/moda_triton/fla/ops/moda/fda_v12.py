@@ -832,16 +832,26 @@ def parallel_fda_bwd_kernel_dkdv(
             depth_ids = depth_col_ids
             valid_rows = depth_ids < depth_block_end
 
-            k_idx = tl.arange(0, K)[None, :]
+            k_idx = tl.arange(0, BK)[None, :]
             dk_row_offsets = ((bos_cached + depth_ids) * HQ + i_hq) * K
             dk_ptrs = d_cached_k + dk_row_offsets[:, None] + k_idx
+            dk_mask = valid_rows[:, None] & (k_idx < K)
 
-            tl.store(dk_ptrs, b_dk_depth.to(b_k_depth.dtype), mask=valid_rows[:, None])
+            tl.store(
+                dk_ptrs,
+                b_dk_depth.to(d_cached_k.dtype.element_ty),
+                mask=dk_mask,
+            )
 
-            v_idx = tl.arange(0, V)[None, :]
+            v_idx = tl.arange(0, BV)[None, :]
             dv_row_offsets = ((bos_cached + depth_ids) * HQ + i_hq) * V
             dv_ptrs = d_cached_v + dv_row_offsets[:, None] + v_idx
-            tl.store(dv_ptrs, b_dv_depth.to(b_v_depth.dtype), mask=valid_rows[:, None])
+            dv_mask = valid_rows[:, None] & (v_idx < V)
+            tl.store(
+                dv_ptrs,
+                b_dv_depth.to(d_cached_v.dtype.element_ty),
+                mask=dv_mask,
+            )
 
 
 # ==============================================================================

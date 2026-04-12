@@ -73,6 +73,7 @@ def parallel_moda_chunk_visible_fwd_kernel(
     USE_G: tl.constexpr,
     IS_VARLEN: tl.constexpr,
     USE_DEPTH: tl.constexpr,
+    CHUNK_VISIBLE: tl.constexpr,
 ):
 
     i_v, i_t, i_bh = (
@@ -321,9 +322,12 @@ def parallel_moda_chunk_visible_fwd_kernel(
             row_mask = row_valid[:, None]
 
             col_mask = depth_col_ids[None, :] < depth_block_end
-            causal_mask = depth_row_ids[None, :] <= o_q_base[:, None]
+            if CHUNK_VISIBLE:
+                depth_mask = depth_row_ids[None, :] <= o_q_base[:, None]
+            else:
+                depth_mask = depth_row_ids[None, :] == o_q_base[:, None]
 
-            mask_depth = row_mask & col_mask & causal_mask
+            mask_depth = row_mask & col_mask & depth_mask
 
             b_s_depth = tl.where(mask_depth, b_s_depth, float("-inf"))
 
@@ -478,6 +482,7 @@ def parallel_moda_fwd(
         BS=BS,
         BK=BK,
         BV=BV,
+        CHUNK_VISIBLE=False,
         num_warps=num_warps,
     )
     return o, lse
@@ -615,6 +620,7 @@ def parallel_moda_chunk_visible_fwd(
         BS=BS,
         BK=BK,
         BV=BV,
+        CHUNK_VISIBLE=True,
         num_warps=num_warps,
     )
     return o, lse
@@ -1594,23 +1600,25 @@ def parallel_attn_bwd_kernel_dkv_depth(
             depth_ids = depth_col_ids
             valid_rows = depth_ids < depth_block_end
 
-            k_idx = tl.arange(0, K)[None, :]
+            k_idx = tl.arange(0, BK)[None, :]
             dk_row_offsets = ((bos_cached + depth_ids) * HQ + i_hq) * K
             dk_ptrs = d_cached_k + dk_row_offsets[:, None] + k_idx
+            dk_mask = valid_rows[:, None] & (k_idx < K)
 
             tl.store(
                 dk_ptrs,
-                b_dk_depth.to(b_k_depth.dtype),
-                mask=valid_rows[:, None],
+                b_dk_depth.to(d_cached_k.dtype.element_ty),
+                mask=dk_mask,
             )
 
-            v_idx = tl.arange(0, V)[None, :]
+            v_idx = tl.arange(0, BV)[None, :]
             dv_row_offsets = ((bos_cached + depth_ids) * HQ + i_hq) * V
             dv_ptrs = d_cached_v + dv_row_offsets[:, None] + v_idx
+            dv_mask = valid_rows[:, None] & (v_idx < V)
             tl.store(
                 dv_ptrs,
-                b_dv_depth.to(b_v_depth.dtype),
-                mask=valid_rows[:, None],
+                b_dv_depth.to(d_cached_v.dtype.element_ty),
+                mask=dv_mask,
             )
 
 
@@ -1797,23 +1805,25 @@ def parallel_attn_chunk_visible_bwd_kernel_dkv_depth(
             depth_ids = depth_col_ids
             valid_rows = depth_ids < depth_block_end
 
-            k_idx = tl.arange(0, K)[None, :]
+            k_idx = tl.arange(0, BK)[None, :]
             dk_row_offsets = ((bos_cached + depth_ids) * HQ + i_hq) * K
             dk_ptrs = d_cached_k + dk_row_offsets[:, None] + k_idx
+            dk_mask = valid_rows[:, None] & (k_idx < K)
 
             tl.store(
                 dk_ptrs,
-                b_dk_depth.to(b_k_depth.dtype),
-                mask=valid_rows[:, None],
+                b_dk_depth.to(d_cached_k.dtype.element_ty),
+                mask=dk_mask,
             )
 
-            v_idx = tl.arange(0, V)[None, :]
+            v_idx = tl.arange(0, BV)[None, :]
             dv_row_offsets = ((bos_cached + depth_ids) * HQ + i_hq) * V
             dv_ptrs = d_cached_v + dv_row_offsets[:, None] + v_idx
+            dv_mask = valid_rows[:, None] & (v_idx < V)
             tl.store(
                 dv_ptrs,
-                b_dv_depth.to(b_v_depth.dtype),
-                mask=valid_rows[:, None],
+                b_dv_depth.to(d_cached_v.dtype.element_ty),
+                mask=dv_mask,
             )
 
 
@@ -1900,21 +1910,18 @@ def parallel_moda_bwd(
         BK = 64
         BV = 64
         num_warps = 8
-
     elif is_target_gpu(device_id, "H20"):
         BT = 32
         BS = 32
         BK = 64
         BV = 64
         num_warps = 4
-
     elif is_target_gpu(device_id, "A100"):
         BT = 32
         BS = 32
         BK = 64
         BV = 64
         num_warps = 4
-
     else:
         print("Target GPU is not optimized")
 
@@ -1929,7 +1936,6 @@ def parallel_moda_bwd(
     dq = torch.empty(
         B, T_q, HQ, K, dtype=k.dtype if H == HQ else torch.float, device=q.device
     )
-
     dk = torch.empty(
         B, T_kv, HQ, K, dtype=k.dtype if H == HQ else torch.float, device=q.device
     )
@@ -1970,8 +1976,6 @@ def parallel_moda_bwd(
         )
 
     grid = (NV, NT, B * HQ)
-
-    dg_cumsum_k = None
 
     parallel_moda_bwd_kernel_dq[grid](
         q=q,
@@ -2014,7 +2018,7 @@ def parallel_moda_bwd(
         do=do,
         dk=dk,
         dv=dv,
-        dg_cumsum=dg_cumsum_k,
+        dg_cumsum=None,
         cu_seqlens=cu_seqlens,
         chunk_indices=chunk_indices,
         scale=scale,
@@ -2034,7 +2038,6 @@ def parallel_moda_bwd(
     )
 
     if use_depth:
-
         assert NV == 1, "Depth dkv backward currently supports only NV == 1 (BV >= V)"
         parallel_attn_bwd_kernel_dkv_depth[grid](
             q=q,
@@ -2064,10 +2067,9 @@ def parallel_moda_bwd(
             BV=BV,
             num_warps=num_warps,
         )
+
     dk = reduce(dk, "b t (h g) k -> b t h k", g=G, reduction="sum")
     dv = reduce(dv, "b t (h g) v -> b t h v", g=G, reduction="sum")
-    if g_cumsum is not None and dg_cumsum_k is not None:
-        dg_cumsum.add_(dg_cumsum_k)
 
     if use_depth:
         d_cached_k = reduce(
@@ -2566,6 +2568,57 @@ def naive_mixture_of_depth_causal_chunk_visible_ref(
     return out, lse
 
 
+def _resolve_chunk_visible_bt(
+    device_index: int | None = None, customized_BT: Optional[int] = None
+) -> int:
+    if customized_BT is not None:
+        return customized_BT
+    if is_target_gpu(device_index, "H800"):
+        return 64
+    if is_target_gpu(device_index, "H20"):
+        return 64
+    if is_target_gpu(device_index, "A100"):
+        return 64
+    return 128
+
+
+def _resolve_chunk_visible_geometry(
+    device_index: int | None = None,
+    moda_group_num: int = 1,
+    customized_BT: Optional[int] = None,
+) -> Tuple[int, int]:
+    bt_eff = _resolve_chunk_visible_bt(device_index, customized_BT)
+    assert (
+        bt_eff % moda_group_num == 0
+    ), "BT must be divisible by moda_group_num to keep chunk-visible base_t aligned"
+    return bt_eff, bt_eff // moda_group_num
+
+
+def _chunk_visible_reference(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    kd: Optional[torch.Tensor] = None,
+    vd: Optional[torch.Tensor] = None,
+    scale: Optional[float] = None,
+    moda_group_num: int = 1,
+    customized_BT: Optional[int] = None,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    _bt_eff, chunk_size = _resolve_chunk_visible_geometry(
+        q.device.index, moda_group_num, customized_BT
+    )
+    return naive_mixture_of_depth_causal_chunk_visible_ref(
+        q=q,
+        k=k,
+        v=v,
+        kd=kd,
+        vd=vd,
+        scale=scale,
+        moda_group_num=moda_group_num,
+        chunk_size=chunk_size,
+    )
+
+
 def naive_mixture_of_depth_causal_ref_vis(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -2688,6 +2741,91 @@ def accuracy_report(out_impl, out_ref, name):
     )
 
 
+def _make_random_moda_inputs(
+    *,
+    B: int,
+    T_kv: int,
+    H: int,
+    K: int,
+    V: int,
+    L: int,
+    moda_group_num: int,
+    device: str,
+    dtype: torch.dtype,
+    requires_grad: bool = False,
+):
+    tensor_kwargs = {"device": device, "dtype": dtype, "requires_grad": requires_grad}
+    T_q = T_kv * moda_group_num
+    q = torch.randn(B, T_q, H, K, **tensor_kwargs)
+    k = torch.randn(B, T_kv, H, K, **tensor_kwargs)
+    v = torch.randn(B, T_kv, H, V, **tensor_kwargs)
+    if L > 0:
+        kd = torch.randn(B, T_kv * L, H, K, **tensor_kwargs)
+        vd = torch.randn(B, T_kv * L, H, V, **tensor_kwargs)
+    else:
+        kd = None
+        vd = None
+    return q, k, v, kd, vd
+
+
+def _clone_optional_tensor(
+    tensor: Optional[torch.Tensor], requires_grad: bool
+) -> Optional[torch.Tensor]:
+    if tensor is None:
+        return None
+    cloned = tensor.detach().clone()
+    if requires_grad:
+        cloned.requires_grad_(True)
+    return cloned
+
+
+def _run_reference_backward(
+    reference_impl,
+    *,
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    grad_out: torch.Tensor,
+    scale: float,
+    moda_group_num: int,
+    kd: Optional[torch.Tensor] = None,
+    vd: Optional[torch.Tensor] = None,
+    reference_kwargs: Optional[dict] = None,
+    q_requires_grad: bool = True,
+    k_requires_grad: bool = True,
+    v_requires_grad: bool = True,
+    kd_requires_grad: bool = True,
+    vd_requires_grad: bool = True,
+):
+    q_ref = _clone_optional_tensor(q, q_requires_grad)
+    k_ref = _clone_optional_tensor(k, k_requires_grad)
+    v_ref = _clone_optional_tensor(v, v_requires_grad)
+    kd_ref = _clone_optional_tensor(kd, kd is not None and kd_requires_grad)
+    vd_ref = _clone_optional_tensor(vd, vd is not None and vd_requires_grad)
+
+    out_ref, lse_ref = reference_impl(
+        q_ref,
+        k_ref,
+        v_ref,
+        kd=kd_ref,
+        vd=vd_ref,
+        scale=scale,
+        moda_group_num=moda_group_num,
+        **(reference_kwargs or {}),
+    )
+    loss = (out_ref * grad_out).sum()
+    loss.backward()
+    return (
+        out_ref,
+        lse_ref,
+        q_ref.grad,
+        k_ref.grad if k_ref is not None else None,
+        v_ref.grad if v_ref is not None else None,
+        kd_ref.grad if kd_ref is not None else None,
+        vd_ref.grad if vd_ref is not None else None,
+    )
+
+
 def test_once(
     B=2,
     T=21,
@@ -2709,18 +2847,17 @@ def test_once(
 
     HQ = H
     scale = 1.0 / math.sqrt(K)
-
-    q = torch.randn(B, TQ, HQ, K, dtype=dtype, device=device)
-    k = torch.randn(B, T, H, K, dtype=dtype, device=device)
-    v = torch.randn(B, T, H, V, dtype=dtype, device=device)
-
-    use_depth = L > 0
-    if use_depth:
-        kd = torch.randn(B, T * L, H, K, dtype=dtype, device=device)
-        vd = torch.randn(B, T * L, H, V, dtype=dtype, device=device)
-    else:
-        kd = None
-        vd = None
+    q, k, v, kd, vd = _make_random_moda_inputs(
+        B=B,
+        T_kv=T,
+        H=HQ,
+        K=K,
+        V=V,
+        L=L,
+        moda_group_num=moda_group_num,
+        device=device,
+        dtype=dtype,
+    )
 
     ref_out, ref_lse = naive_mixture_of_depth_causal_ref(
         q, k, v, kd=kd, vd=vd, scale=scale, moda_group_num=moda_group_num
@@ -2859,10 +2996,17 @@ def test_dq_backward(
         f"\n==== DQ TEST (NO DEPTH, moda_group_num=1) B={B} T={T} H={H} K={K} V={V} dtype={dtype} ===="
     )
     scale = 1.0 / math.sqrt(K)
-
-    q = torch.randn(B, T, H, K, dtype=dtype, device=device)
-    k = torch.randn(B, T, H, K, dtype=dtype, device=device)
-    v = torch.randn(B, T, H, V, dtype=dtype, device=device)
+    q, k, v, _, _ = _make_random_moda_inputs(
+        B=B,
+        T_kv=T,
+        H=H,
+        K=K,
+        V=V,
+        L=0,
+        moda_group_num=1,
+        device=device,
+        dtype=dtype,
+    )
 
     with torch.no_grad():
         o_kernel, lse_kernel = parallel_moda_fwd(
@@ -2895,16 +3039,18 @@ def test_dq_backward(
             moda_group_num=1,
         )
 
-    q_ref = q.clone().detach().requires_grad_(True)
-    k_ref = k.clone().detach()
-    v_ref = v.clone().detach()
-
-    out_ref, _ = naive_mixture_of_depth_causal_ref(
-        q_ref, k_ref, v_ref, kd=None, vd=None, scale=scale, moda_group_num=1
+    out_ref, _, dq_ref, _, _, _, _ = _run_reference_backward(
+        naive_mixture_of_depth_causal_ref,
+        q=q,
+        k=k,
+        v=v,
+        grad_out=do,
+        scale=scale,
+        moda_group_num=1,
+        q_requires_grad=True,
+        k_requires_grad=False,
+        v_requires_grad=False,
     )
-    loss = (out_ref * do).sum()
-    loss.backward()
-    dq_ref = q_ref.grad
 
     accuracy_report(dq_impl.float(), dq_ref.float(), "DQ Kernel vs Ref")
     return dq_impl, dq_ref
@@ -2927,14 +3073,17 @@ def test_dkv_backward(
     )
     scale = 1.0 / math.sqrt(K)
 
-    if moda_group_num > 1:
-        Tq = T * moda_group_num
-    else:
-        Tq = T
-
-    q = torch.randn(B, Tq, H, K, dtype=dtype, device=device)
-    k = torch.randn(B, T, H, K, dtype=dtype, device=device)
-    v = torch.randn(B, T, H, V, dtype=dtype, device=device)
+    q, k, v, _, _ = _make_random_moda_inputs(
+        B=B,
+        T_kv=T,
+        H=H,
+        K=K,
+        V=V,
+        L=0,
+        moda_group_num=moda_group_num,
+        device=device,
+        dtype=dtype,
+    )
 
     with torch.no_grad():
         o_kernel, lse_kernel = parallel_moda_fwd(
@@ -2967,24 +3116,18 @@ def test_dkv_backward(
             moda_group_num=moda_group_num,
         )
 
-    q_ref = q.detach().clone().requires_grad_(True)
-    k_ref = k.detach().clone().requires_grad_(True)
-    v_ref = v.detach().clone().requires_grad_(True)
-
-    out_ref, _ = naive_mixture_of_depth_causal_ref(
-        q_ref,
-        k_ref,
-        v_ref,
-        kd=None,
-        vd=None,
+    out_ref, _, _, dk_ref, dv_ref, _, _ = _run_reference_backward(
+        naive_mixture_of_depth_causal_ref,
+        q=q,
+        k=k,
+        v=v,
+        grad_out=do,
         scale=scale,
         moda_group_num=moda_group_num,
+        q_requires_grad=False,
+        k_requires_grad=True,
+        v_requires_grad=True,
     )
-    loss = (out_ref * do).sum()
-    loss.backward()
-
-    dk_ref = k_ref.grad
-    dv_ref = v_ref.grad
 
     accuracy_report(dk_impl.float(), dk_ref.float(), "dK Kernel vs Ref")
     accuracy_report(dv_impl.float(), dv_ref.float(), "dV Kernel vs Ref")
@@ -3009,15 +3152,17 @@ def test_dkv_backward_depth(
     )
     T_q = T_kv * moda_group_num
     scale = 1.0 / math.sqrt(K)
-    q = torch.randn(B, T_q, H, K, dtype=dtype, device=device)
-    k = torch.randn(B, T_kv, H, K, dtype=dtype, device=device)
-    v = torch.randn(B, T_kv, H, V, dtype=dtype, device=device)
-    if L > 0:
-        kd = torch.randn(B, T_kv * L, H, K, dtype=dtype, device=device)
-        vd = torch.randn(B, T_kv * L, H, V, dtype=dtype, device=device)
-    else:
-        kd = None
-        vd = None
+    q, k, v, kd, vd = _make_random_moda_inputs(
+        B=B,
+        T_kv=T_kv,
+        H=H,
+        K=K,
+        V=V,
+        L=L,
+        moda_group_num=moda_group_num,
+        device=device,
+        dtype=dtype,
+    )
     with torch.no_grad():
         o_kernel, lse_kernel = parallel_moda_fwd(
             q=q,
@@ -3046,24 +3191,22 @@ def test_dkv_backward_depth(
             cached_v=vd,
             moda_group_num=moda_group_num,
         )
-    q_ref = q.detach().clone().requires_grad_(True)
-    k_ref = k.detach().clone().requires_grad_(True)
-    v_ref = v.detach().clone().requires_grad_(True)
-    kd_ref = kd.detach().clone().requires_grad_(True) if kd is not None else None
-    vd_ref = vd.detach().clone().requires_grad_(True) if vd is not None else None
-    out_ref, _ = naive_mixture_of_depth_causal_ref(
-        q_ref,
-        k_ref,
-        v_ref,
-        kd=kd_ref,
-        vd=vd_ref,
+    out_ref, _, _, _, _, dkd_ref, dvd_ref = _run_reference_backward(
+        naive_mixture_of_depth_causal_ref,
+        q=q,
+        k=k,
+        v=v,
+        kd=kd,
+        vd=vd,
+        grad_out=do,
         scale=scale,
         moda_group_num=moda_group_num,
+        q_requires_grad=False,
+        k_requires_grad=False,
+        v_requires_grad=False,
+        kd_requires_grad=kd is not None,
+        vd_requires_grad=vd is not None,
     )
-    loss = (out_ref * do).sum()
-    loss.backward()
-    dkd_ref = kd_ref.grad if kd is not None else None
-    dvd_ref = vd_ref.grad if vd is not None else None
 
     if kd is not None:
         accuracy_report(dkd_impl.float(), dkd_ref.float(), "dK_depth Kernel vs Ref")
@@ -3089,17 +3232,17 @@ def test_dq_backward_depth(
     torch.manual_seed(seed)
     T_q = T_kv * moda_group_num
     scale = 1.0 / (K**0.5)
-
-    q = torch.randn(B, T_q, H, K, dtype=dtype, device=device)
-    k = torch.randn(B, T_kv, H, K, dtype=dtype, device=device)
-    v = torch.randn(B, T_kv, H, V, dtype=dtype, device=device)
-
-    if L > 0:
-        kd = torch.randn(B, T_kv * L, H, K, dtype=dtype, device=device)
-        vd = torch.randn(B, T_kv * L, H, V, dtype=dtype, device=device)
-    else:
-        kd = None
-        vd = None
+    q, k, v, kd, vd = _make_random_moda_inputs(
+        B=B,
+        T_kv=T_kv,
+        H=H,
+        K=K,
+        V=V,
+        L=L,
+        moda_group_num=moda_group_num,
+        device=device,
+        dtype=dtype,
+    )
 
     with torch.no_grad():
         o, lse = parallel_moda_fwd(
@@ -3130,23 +3273,22 @@ def test_dq_backward_depth(
             moda_group_num=moda_group_num,
         )
 
-    q_ref = q.detach().clone().requires_grad_(True)
-    k_ref = k.detach()
-    v_ref = v.detach()
-    kd_ref = kd.detach() if kd is not None else None
-    vd_ref = vd.detach() if vd is not None else None
-    out_ref, _ = naive_mixture_of_depth_causal_ref(
-        q_ref,
-        k_ref,
-        v_ref,
-        kd=kd_ref,
-        vd=vd_ref,
+    out_ref, _, dq_ref, _, _, _, _ = _run_reference_backward(
+        naive_mixture_of_depth_causal_ref,
+        q=q,
+        k=k,
+        v=v,
+        kd=kd,
+        vd=vd,
+        grad_out=do,
         scale=scale,
         moda_group_num=moda_group_num,
+        q_requires_grad=True,
+        k_requires_grad=False,
+        v_requires_grad=False,
+        kd_requires_grad=False,
+        vd_requires_grad=False,
     )
-    loss = (out_ref * do).sum()
-    loss.backward()
-    dq_ref = q_ref.grad
     accuracy_report(dq_impl.float(), dq_ref.float(), "DQ Depth Kernel vs Ref")
 
 
@@ -3159,6 +3301,104 @@ def main_dkv_accuracy():
 
 
 RCP_LN2_CONST: float = 1.4426950216
+
+
+def _parallel_moda_autograd_forward(
+    ctx,
+    *,
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    g: Optional[torch.Tensor],
+    scale: float,
+    cu_seqlens: Optional[torch.Tensor],
+    cached_k: Optional[torch.Tensor],
+    cached_v: Optional[torch.Tensor],
+    moda_group_num: int,
+    fwd_impl,
+):
+    assert g is None, "g is not supported in this version"
+    assert cu_seqlens is None, "cu_seqlens is not supported in this version"
+
+    if g is not None:
+        g_cumsum = chunk_global_cumsum(g, cu_seqlens=cu_seqlens, scale=RCP_LN2_CONST)
+    else:
+        g_cumsum = None
+
+    o, lse = fwd_impl(
+        q=q,
+        k=k,
+        v=v,
+        g_cumsum=g_cumsum,
+        scale=scale,
+        cu_seqlens=cu_seqlens,
+        cached_k=cached_k,
+        cached_v=cached_v,
+        moda_group_num=moda_group_num,
+    )
+
+    ctx.save_for_backward(
+        q,
+        k,
+        v,
+        o,
+        g_cumsum,
+        lse,
+        *([cached_k, cached_v] if (cached_k is not None and cached_v is not None) else []),
+    )
+    ctx.has_depth = cached_k is not None and cached_v is not None
+    ctx.num_saved_no_depth = 6
+    ctx.scale = scale
+    ctx.cu_seqlens = cu_seqlens
+    ctx.moda_group_num = moda_group_num
+    ctx.has_g = g is not None
+    ctx.dtype = q.dtype
+
+    return o.to(q.dtype), lse
+
+
+def _parallel_moda_autograd_backward(ctx, do, *, bwd_impl):
+    if ctx.has_depth:
+        q, k, v, o, g_cumsum, lse, cached_k, cached_v = ctx.saved_tensors
+    else:
+        q, k, v, o, g_cumsum, lse = ctx.saved_tensors
+        cached_k = cached_v = None
+
+    dq, dk, dv, dg_cumsum, d_cached_k, d_cached_v = bwd_impl(
+        q=q,
+        k=k,
+        v=v,
+        o=o,
+        g_cumsum=g_cumsum,
+        lse=lse,
+        do=do,
+        scale=ctx.scale,
+        cu_seqlens=ctx.cu_seqlens,
+        cached_k=cached_k,
+        cached_v=cached_v,
+        moda_group_num=ctx.moda_group_num,
+    )
+
+    if ctx.has_g and dg_cumsum is not None:
+        dg = chunk_global_cumsum(dg_cumsum, cu_seqlens=ctx.cu_seqlens, reverse=True)
+    else:
+        dg = None
+
+    if not ctx.has_depth:
+        d_cached_k = None
+        d_cached_v = None
+
+    return (
+        dq.to(q),
+        dk.to(k),
+        dv.to(v),
+        dg,
+        None,
+        None,
+        d_cached_k,
+        d_cached_v,
+        None,
+    )
 
 
 class ParallelMixtureOfDepthAttentionFunction(torch.autograd.Function):
@@ -3178,103 +3418,25 @@ class ParallelMixtureOfDepthAttentionFunction(torch.autograd.Function):
         cached_v: Optional[torch.Tensor] = None,
         moda_group_num: int = 1,
     ):
-
-        assert g is None, "g is not supported in this version"
-        assert cu_seqlens is None, "cu_seqlens is not supported in this version"
-
-        if g is not None:
-            g_cumsum = chunk_global_cumsum(
-                g, cu_seqlens=cu_seqlens, scale=RCP_LN2_CONST
-            )
-        else:
-            g_cumsum = None
-
-        o, lse = parallel_moda_fwd(
+        return _parallel_moda_autograd_forward(
+            ctx,
             q=q,
             k=k,
             v=v,
-            g_cumsum=g_cumsum,
+            g=g,
             scale=scale,
             cu_seqlens=cu_seqlens,
             cached_k=cached_k,
             cached_v=cached_v,
             moda_group_num=moda_group_num,
+            fwd_impl=parallel_moda_fwd,
         )
-
-        ctx.save_for_backward(
-            q,
-            k,
-            v,
-            o,
-            g_cumsum,
-            lse,
-            *(
-                [cached_k, cached_v]
-                if (cached_k is not None and cached_v is not None)
-                else []
-            ),
-        )
-        ctx.has_depth = cached_k is not None and cached_v is not None
-        ctx.num_saved_no_depth = 6
-        ctx.scale = scale
-        ctx.cu_seqlens = cu_seqlens
-        ctx.moda_group_num = moda_group_num
-        ctx.has_g = g is not None
-        ctx.dtype = q.dtype
-
-        return o.to(q.dtype), lse
 
     @staticmethod
     @contiguous
     @autocast_custom_bwd
     def backward(ctx, do, dlse_unused):
-
-        if ctx.has_depth:
-            q, k, v, o, g_cumsum, lse, cached_k, cached_v = ctx.saved_tensors
-        else:
-            q, k, v, o, g_cumsum, lse = ctx.saved_tensors
-            cached_k = cached_v = None
-
-        dq, dk, dv, dg_cumsum, d_cached_k, d_cached_v = parallel_moda_bwd(
-            q=q,
-            k=k,
-            v=v,
-            o=o,
-            g_cumsum=g_cumsum,
-            lse=lse,
-            do=do,
-            scale=ctx.scale,
-            cu_seqlens=ctx.cu_seqlens,
-            cached_k=cached_k,
-            cached_v=cached_v,
-            moda_group_num=ctx.moda_group_num,
-        )
-
-        if ctx.has_g and dg_cumsum is not None:
-
-            dg = chunk_global_cumsum(dg_cumsum, cu_seqlens=ctx.cu_seqlens, reverse=True)
-        else:
-            dg = None
-
-        d_scale = None
-        d_cu = None
-        d_moda = None
-
-        if not ctx.has_depth:
-            d_cached_k = None
-            d_cached_v = None
-
-        return (
-            dq.to(q),
-            dk.to(k),
-            dv.to(v),
-            dg,
-            d_scale,
-            d_cu,
-            d_cached_k,
-            d_cached_v,
-            d_moda,
-        )
+        return _parallel_moda_autograd_backward(ctx, do, bwd_impl=parallel_moda_bwd)
 
 
 class ParallelMixtureOfDepthAttentionChunkVisibleFunction(torch.autograd.Function):
@@ -3294,102 +3456,99 @@ class ParallelMixtureOfDepthAttentionChunkVisibleFunction(torch.autograd.Functio
         cached_v: Optional[torch.Tensor] = None,
         moda_group_num: int = 1,
     ):
-
-        assert g is None, "g is not supported in this version"
-        assert cu_seqlens is None, "cu_seqlens is not supported in this version"
-
-        if g is not None:
-            g_cumsum = chunk_global_cumsum(
-                g, cu_seqlens=cu_seqlens, scale=RCP_LN2_CONST
-            )
-        else:
-            g_cumsum = None
-
-        o, lse = parallel_moda_chunk_visible_fwd(
+        return _parallel_moda_autograd_forward(
+            ctx,
             q=q,
             k=k,
             v=v,
-            g_cumsum=g_cumsum,
+            g=g,
             scale=scale,
             cu_seqlens=cu_seqlens,
             cached_k=cached_k,
             cached_v=cached_v,
             moda_group_num=moda_group_num,
+            fwd_impl=parallel_moda_chunk_visible_fwd,
         )
-
-        ctx.save_for_backward(
-            q,
-            k,
-            v,
-            o,
-            g_cumsum,
-            lse,
-            *(
-                [cached_k, cached_v]
-                if (cached_k is not None and cached_v is not None)
-                else []
-            ),
-        )
-        ctx.has_depth = cached_k is not None and cached_v is not None
-        ctx.num_saved_no_depth = 6
-        ctx.scale = scale
-        ctx.cu_seqlens = cu_seqlens
-        ctx.moda_group_num = moda_group_num
-        ctx.has_g = g is not None
-        ctx.dtype = q.dtype
-
-        return o.to(q.dtype), lse
 
     @staticmethod
     @contiguous
     @autocast_custom_bwd
     def backward(ctx, do, dlse_unused):
-
-        if ctx.has_depth:
-            q, k, v, o, g_cumsum, lse, cached_k, cached_v = ctx.saved_tensors
-        else:
-            q, k, v, o, g_cumsum, lse = ctx.saved_tensors
-            cached_k = cached_v = None
-
-        dq, dk, dv, dg_cumsum, d_cached_k, d_cached_v = parallel_moda_chunk_visible_bwd(
-            q=q,
-            k=k,
-            v=v,
-            o=o,
-            g_cumsum=g_cumsum,
-            lse=lse,
-            do=do,
-            scale=ctx.scale,
-            cu_seqlens=ctx.cu_seqlens,
-            cached_k=cached_k,
-            cached_v=cached_v,
-            moda_group_num=ctx.moda_group_num,
+        return _parallel_moda_autograd_backward(
+            ctx, do, bwd_impl=parallel_moda_chunk_visible_bwd
         )
 
-        if ctx.has_g and dg_cumsum is not None:
-            dg = chunk_global_cumsum(dg_cumsum, cu_seqlens=ctx.cu_seqlens, reverse=True)
-        else:
-            dg = None
 
-        d_scale = None
-        d_cu = None
-        d_moda = None
-
-        if not ctx.has_depth:
-            d_cached_k = None
-            d_cached_v = None
-
-        return (
-            dq.to(q),
-            dk.to(k),
-            dv.to(v),
-            dg,
-            d_scale,
-            d_cu,
-            d_cached_k,
-            d_cached_v,
-            d_moda,
+def _prepare_parallel_moda_wrapper_inputs(
+    *,
+    api_name: str,
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    g: Optional[torch.Tensor],
+    cached_k: Optional[torch.Tensor],
+    cached_v: Optional[torch.Tensor],
+    scale: Optional[float],
+    moda_group_num: int,
+    head_first: bool,
+    return_depth_grads: bool,
+    warn_shape: bool,
+):
+    if head_first:
+        q = q.transpose(1, 2)
+        k = k.transpose(1, 2)
+        v = v.transpose(1, 2)
+        if g is not None:
+            g = g.transpose(1, 2)
+        if cached_k is not None and cached_v is not None:
+            cached_k = cached_k.transpose(1, 2)
+            cached_v = cached_v.transpose(1, 2)
+    elif warn_shape and q.shape[1] < q.shape[2]:
+        warnings.warn(
+            f"[{api_name}] detected seq_len({q.shape[1]}) < num_heads({q.shape[2]}). "
+            "input may be in head_first format while head_first=True is not set."
         )
+
+    B, T_q, HQ, Kdim = q.shape
+    T_kv = k.shape[1]
+    H = k.shape[2]
+    assert HQ % H == 0, "HQ must be an integer multiple of H (GQA)"
+    if scale is None:
+        scale = Kdim**-0.5
+
+    if moda_group_num > 1:
+        assert (
+            T_q == T_kv * moda_group_num
+        ), "When moda_group_num > 1, T_q must equal T_kv * moda_group_num"
+    else:
+        assert T_q == T_kv, "When moda_group_num=1, T_q must equal T_kv"
+
+    use_depth = cached_k is not None and cached_v is not None
+    if use_depth:
+        assert cached_k.shape[0] == B and cached_v.shape[0] == B
+        assert (
+            cached_k.shape[2] == H and cached_v.shape[2] == H
+        ), "cached_k/v head count mismatch"
+        assert cached_k.shape[1] % T_kv == 0, "cached_k time dimension must be T_kv * L"
+        L = cached_k.shape[1] // T_kv
+        assert cached_v.shape[1] == T_kv * L, "cached_v shape mismatch"
+        if (
+            cached_k.requires_grad or cached_v.requires_grad
+        ) and not return_depth_grads:
+            warnings.warn(
+                "cached_k/v requires gradients, but return_depth_grads=False. Gradients are still computed and returned."
+            )
+
+    if g is not None:
+        assert g.shape[:3] == (B, T_q, HQ), "g must be [B,T_q,HQ]"
+
+    return q, k, v, g, cached_k, cached_v, scale
+
+
+def _maybe_return_lse(o: torch.Tensor, lse: torch.Tensor, need_lse: bool):
+    if need_lse:
+        return o, lse
+    return o
 
 
 def parallel_moda(
@@ -3411,65 +3570,25 @@ def parallel_moda(
     customized_BT_backward: int = None,
     customized_BS_backward: int = None,
 ):
-
-    if head_first:
-
-        q = q.transpose(1, 2)
-        k = k.transpose(1, 2)
-        v = v.transpose(1, 2)
-        if g is not None:
-            g = g.transpose(1, 2)
-        if cached_k is not None and cached_v is not None:
-            cached_k = cached_k.transpose(1, 2)
-            cached_v = cached_v.transpose(1, 2)
-    else:
-        if warn_shape and q.shape[1] < q.shape[2]:
-            warnings.warn(
-                f"[parallel_moda] detected seq_len({q.shape[1]}) < num_heads({q.shape[2]}). "
-                "input may be in head_first format while head_first=True is not set."
-            )
-
-    B, T_q, HQ, Kdim = q.shape
-    T_kv = k.shape[1]
-    H = k.shape[2]
-    assert HQ % H == 0, "HQ must be an integer multiple of H (GQA)"
-    if scale is None:
-        scale = Kdim**-0.5
-
-    if moda_group_num > 1:
-        assert (
-            T_q == T_kv * moda_group_num
-        ), "When moda_group_num > 1, T_q must equal T_kv * moda_group_num"
-    else:
-        assert T_q == T_kv, "When moda_group_num=1, T_q must equal T_kv"
-
-    use_depth = cached_k is not None and cached_v is not None
-    if use_depth:
-        assert cached_k.shape[0] == B and cached_v.shape[0] == B
-        assert (
-            cached_k.shape[2] == H and cached_v.shape[2] == H
-        ), "cached_k/v head count mismatch"
-        assert cached_k.shape[1] % T_kv == 0, "cached_k time dimension must be T_kv * L"
-        L = cached_k.shape[1] // T_kv
-        assert cached_v.shape[1] == T_kv * L, "cached_v shape mismatch"
-        if (
-            cached_k.requires_grad or cached_v.requires_grad
-        ) and not return_depth_grads:
-            warnings.warn(
-                "cached_k/v requires gradients, but return_depth_grads=False. Gradients are still computed and returned."
-            )
-
-    if g is not None:
-        assert g.shape[:3] == (B, T_q, HQ), "g must be [B,T_q,HQ]"
+    q, k, v, g, cached_k, cached_v, scale = _prepare_parallel_moda_wrapper_inputs(
+        api_name="parallel_moda",
+        q=q,
+        k=k,
+        v=v,
+        g=g,
+        cached_k=cached_k,
+        cached_v=cached_v,
+        scale=scale,
+        moda_group_num=moda_group_num,
+        head_first=head_first,
+        return_depth_grads=return_depth_grads,
+        warn_shape=warn_shape,
+    )
 
     o, lse = ParallelMixtureOfDepthAttentionFunction.apply(
         q, k, v, g, scale, cu_seqlens, cached_k, cached_v, moda_group_num
     )
-
-    if need_lse:
-        return o, lse
-    else:
-        return o
+    return _maybe_return_lse(o, lse, need_lse)
 
 
 def parallel_moda_chunk_visible(
@@ -3491,65 +3610,25 @@ def parallel_moda_chunk_visible(
     customized_BT_backward: int = None,
     customized_BS_backward: int = None,
 ):
-
-    if head_first:
-
-        q = q.transpose(1, 2)
-        k = k.transpose(1, 2)
-        v = v.transpose(1, 2)
-        if g is not None:
-            g = g.transpose(1, 2)
-        if cached_k is not None and cached_v is not None:
-            cached_k = cached_k.transpose(1, 2)
-            cached_v = cached_v.transpose(1, 2)
-    else:
-        if warn_shape and q.shape[1] < q.shape[2]:
-            warnings.warn(
-                f"[parallel_moda_chunk_visible] detected seq_len({q.shape[1]}) < num_heads({q.shape[2]}). "
-                "input may be in head_first format while head_first=True is not set."
-            )
-
-    B, T_q, HQ, Kdim = q.shape
-    T_kv = k.shape[1]
-    H = k.shape[2]
-    assert HQ % H == 0, "HQ must be an integer multiple of H (GQA)"
-    if scale is None:
-        scale = Kdim**-0.5
-
-    if moda_group_num > 1:
-        assert (
-            T_q == T_kv * moda_group_num
-        ), "When moda_group_num > 1, T_q must equal T_kv * moda_group_num"
-    else:
-        assert T_q == T_kv, "When moda_group_num=1, T_q must equal T_kv"
-
-    use_depth = cached_k is not None and cached_v is not None
-    if use_depth:
-        assert cached_k.shape[0] == B and cached_v.shape[0] == B
-        assert (
-            cached_k.shape[2] == H and cached_v.shape[2] == H
-        ), "cached_k/v head count mismatch"
-        assert cached_k.shape[1] % T_kv == 0, "cached_k time dimension must be T_kv * L"
-        L = cached_k.shape[1] // T_kv
-        assert cached_v.shape[1] == T_kv * L, "cached_v shape mismatch"
-        if (
-            cached_k.requires_grad or cached_v.requires_grad
-        ) and not return_depth_grads:
-            warnings.warn(
-                "cached_k/v requires gradients, but return_depth_grads=False. Gradients are still computed and returned."
-            )
-
-    if g is not None:
-        assert g.shape[:3] == (B, T_q, HQ), "g must be [B,T_q,HQ]"
+    q, k, v, g, cached_k, cached_v, scale = _prepare_parallel_moda_wrapper_inputs(
+        api_name="parallel_moda_chunk_visible",
+        q=q,
+        k=k,
+        v=v,
+        g=g,
+        cached_k=cached_k,
+        cached_v=cached_v,
+        scale=scale,
+        moda_group_num=moda_group_num,
+        head_first=head_first,
+        return_depth_grads=return_depth_grads,
+        warn_shape=warn_shape,
+    )
 
     o, lse = ParallelMixtureOfDepthAttentionChunkVisibleFunction.apply(
         q, k, v, g, scale, cu_seqlens, cached_k, cached_v, moda_group_num
     )
-
-    if need_lse:
-        return o, lse
-    else:
-        return o
+    return _maybe_return_lse(o, lse, need_lse)
 
 
 def metric(name, x_impl, x_ref, atol=1e-4, rtol=1e-4):
@@ -3583,20 +3662,18 @@ def run_case(
         f"B={B}, T_kv={T_kv}, T_q={T_q}, H={H}, K={K}, V={V}, L={L}, group={moda_group_num}, dtype={dtype}"
     )
 
-    q = torch.randn(B, T_q, H, K, device=device, dtype=dtype, requires_grad=True)
-    k = torch.randn(B, T_kv, H, K, device=device, dtype=dtype, requires_grad=True)
-    v = torch.randn(B, T_kv, H, V, device=device, dtype=dtype, requires_grad=True)
-
-    if L > 0:
-        kd = torch.randn(
-            B, T_kv * L, H, K, device=device, dtype=dtype, requires_grad=True
-        )
-        vd = torch.randn(
-            B, T_kv * L, H, V, device=device, dtype=dtype, requires_grad=True
-        )
-    else:
-        kd = None
-        vd = None
+    q, k, v, kd, vd = _make_random_moda_inputs(
+        B=B,
+        T_kv=T_kv,
+        H=H,
+        K=K,
+        V=V,
+        L=L,
+        moda_group_num=moda_group_num,
+        device=device,
+        dtype=dtype,
+        requires_grad=True,
+    )
 
     scale = 1.0 / math.sqrt(K)
 
@@ -3627,35 +3704,26 @@ def run_case(
     loss_kernel = (out_kernel * grad_out).sum()
     loss_kernel.backward()
 
-    q_ref = q.clone().detach().requires_grad_(True)
-    k_ref = k.clone().detach().requires_grad_(True)
-    v_ref = v.clone().detach().requires_grad_(True)
-    if kd is not None:
-        kd_ref = kd.clone().detach().requires_grad_(True)
-        vd_ref = vd.clone().detach().requires_grad_(True)
-    else:
-        kd_ref = vd_ref = None
-
-    out_ref, _lse_ref = naive_mixture_of_depth_causal_ref(
-        q_ref,
-        k_ref,
-        v_ref,
-        kd=kd_ref,
-        vd=vd_ref,
+    out_ref, _lse_ref, dq_ref, dk_ref, dv_ref, dkd_ref, dvd_ref = _run_reference_backward(
+        naive_mixture_of_depth_causal_ref,
+        q=q,
+        k=k,
+        v=v,
+        kd=kd,
+        vd=vd,
+        grad_out=grad_out,
         scale=scale,
         moda_group_num=moda_group_num,
     )
-    loss_ref = (out_ref * grad_out).sum()
-    loss_ref.backward()
 
     metric("Forward/O", out_kernel, out_ref)
 
-    metric("dQ", q_kernel.grad, q_ref.grad)
-    metric("dK", k_kernel.grad, k_ref.grad)
-    metric("dV", v_kernel.grad, v_ref.grad)
+    metric("dQ", q_kernel.grad, dq_ref)
+    metric("dK", k_kernel.grad, dk_ref)
+    metric("dV", v_kernel.grad, dv_ref)
     if L > 0:
-        metric("dK_depth", kd_kernel.grad, kd_ref.grad)
-        metric("dV_depth", vd_kernel.grad, vd_ref.grad)
+        metric("dK_depth", kd_kernel.grad, dkd_ref)
+        metric("dV_depth", vd_kernel.grad, dvd_ref)
 
 
 def run_case_chunk_visible(
@@ -3696,23 +3764,9 @@ def run_case_chunk_visible(
 
     scale = 1.0 / math.sqrt(K)
 
-    if customized_BT is not None:
-        BT_eff = customized_BT
-    else:
-        device_id = q.device.index
-
-        if is_target_gpu(device_id, "H800"):
-            BT_eff = 64
-        elif is_target_gpu(device_id, "H20"):
-            BT_eff = 64
-        elif is_target_gpu(device_id, "A100"):
-            BT_eff = 64
-        else:
-            BT_eff = 128
-    assert (
-        BT_eff % moda_group_num == 0
-    ), "BT must be divisible by moda_group_num to keep base_t aligned"
-    chunk_size = BT_eff // moda_group_num
+    BT_eff, chunk_size = _resolve_chunk_visible_geometry(
+        q.device.index, moda_group_num, customized_BT
+    )
 
     out_kernel, lse_kernel = parallel_moda_chunk_visible_fwd(
         q=q,
@@ -3731,15 +3785,17 @@ def run_case_chunk_visible(
         customized_num_warps=customized_num_warps,
     )
 
-    out_ref, lse_ref = naive_mixture_of_depth_causal_chunk_visible_ref(
-        q,
-        k,
-        v,
+    out_ref, lse_ref, dq_ref, dk_ref, dv_ref, dkd_ref, dvd_ref = _run_reference_backward(
+        naive_mixture_of_depth_causal_chunk_visible_ref,
+        q=q,
+        k=k,
+        v=v,
         kd=kd,
         vd=vd,
+        grad_out=torch.randn_like(out_kernel),
         scale=scale,
         moda_group_num=moda_group_num,
-        chunk_size=chunk_size,
+        reference_kwargs={"chunk_size": chunk_size},
     )
 
     metric("Forward/O", out_kernel, out_ref)
@@ -3793,34 +3849,25 @@ def run_case_chunk_visible(
         customized_num_warps=customized_num_warps,
     )
 
-    q_ref = q.clone().detach().requires_grad_(True)
-    k_ref = k.clone().detach().requires_grad_(True)
-    v_ref = v.clone().detach().requires_grad_(True)
-    if kd is not None:
-        kd_ref = kd.clone().detach().requires_grad_(True)
-        vd_ref = vd.clone().detach().requires_grad_(True)
-    else:
-        kd_ref = vd_ref = None
-
-    out_ref_bwd, _lse_dummy = naive_mixture_of_depth_causal_chunk_visible_ref(
-        q_ref,
-        k_ref,
-        v_ref,
-        kd=kd_ref,
-        vd=vd_ref,
+    out_ref_bwd, _lse_dummy, q_ref_grad, k_ref_grad, v_ref_grad, kd_ref_grad, vd_ref_grad = _run_reference_backward(
+        naive_mixture_of_depth_causal_chunk_visible_ref,
+        q=q,
+        k=k,
+        v=v,
+        kd=kd,
+        vd=vd,
+        grad_out=grad_out,
         scale=scale,
         moda_group_num=moda_group_num,
-        chunk_size=chunk_size,
+        reference_kwargs={"chunk_size": chunk_size},
     )
-    loss_ref = (out_ref_bwd * grad_out).sum()
-    loss_ref.backward()
 
-    metric("dQ", dq, q_ref.grad)
-    metric("dK", dk, k_ref.grad)
-    metric("dV", dv, v_ref.grad)
+    metric("dQ", dq, q_ref_grad)
+    metric("dK", dk, k_ref_grad)
+    metric("dV", dv, v_ref_grad)
     if L > 0:
-        metric("dK_depth", d_kd, kd_ref.grad)
-        metric("dV_depth", d_vd, vd_ref.grad)
+        metric("dK_depth", d_kd, kd_ref_grad)
+        metric("dV_depth", d_vd, vd_ref_grad)
 
 
 def run_one_case(
