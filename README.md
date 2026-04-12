@@ -24,7 +24,7 @@ ArXiv Preprint ([arXiv 2603.15619](https://arxiv.org/abs/2603.15619)), Blog ([Th
 - [x] Release [MoDA Triton kernel](libs/moda_triton/fla/ops/moda/moda_v14.py) and corresponding test units.
 - [x] Release [Chunk-Visible MoDA Triton kernel](libs/moda_triton/fla/ops/moda/moda_v16.py) and corresponding test units.
 - [x] Release [FDA (Flash Depth Attention) Triton kernel](libs/moda_triton/fla/ops/moda/fda_v12.py) and corresponding test units.
-- [ ] Release Non-Causal MoDA Triton kernel and corresponding test units.
+- [x] Release [Non-Causal MoDA Triton kernel](libs/moda_triton/fla/ops/moda/moda_v14.py) and corresponding test units, note that you only need pass `is_causal=False` to the functions.
 - [ ] Release full LLM training recipe and reproducible configs.
 - [ ] Release full vision tasks training recipe, i.e., Classification on ImageNet.
 
