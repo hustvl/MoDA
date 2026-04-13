@@ -24,7 +24,7 @@ else
 fi
 
 SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
-DEIT_DIR=$(cd "${SCRIPT_DIR}/.." && pwd)
+DEIT_DIR=$(cd "${SCRIPT_DIR}/../.." && pwd)
 PYTHON_BIN=python3
 MODEL_NAME=deit_tiny_patch16_224
 OUTPUT_DIR=${OUTPUT_ROOT}/${MODEL_NAME}
