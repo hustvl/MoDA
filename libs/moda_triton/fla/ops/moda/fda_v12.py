@@ -58,7 +58,7 @@ def parallel_fda_fwd_kernel(
     cached_k,
     cached_v,
     L,
-    dsa_group_num,
+    moda_group_num,
     scale,
     cu_seqlens,
     chunk_indices,
@@ -104,7 +104,7 @@ def parallel_fda_fwd_kernel(
 
         i_t_effective = i_t
 
-    T_kv = T_q // dsa_group_num
+    T_kv = T_q // moda_group_num
 
     bos_q = bos
 
@@ -166,7 +166,7 @@ def parallel_fda_fwd_kernel(
     q_block_end = tl.minimum((i_t_effective + 1) * BT, T_q)
 
     o_q = q_block_start + tl.arange(0, BT)
-    o_q_base = o_q // dsa_group_num
+    o_q_base = o_q // moda_group_num
 
     if USE_DEPTH:
 
@@ -175,14 +175,14 @@ def parallel_fda_fwd_kernel(
         row_valid = o_q < T
         valid_rows = tl.minimum(BT, T_q - q_block_start)
 
-        base_rows_start = q_block_start // dsa_group_num
-        base_rows_end = (q_block_start + valid_rows - 1) // dsa_group_num + 1
+        base_rows_start = q_block_start // moda_group_num
+        base_rows_end = (q_block_start + valid_rows - 1) // moda_group_num + 1
         base_rows_end = tl.minimum(base_rows_end, T_kv)
 
         depth_block_start = base_rows_start * L
         depth_block_end = base_rows_end * L
 
-        row_depth_starts = (o_q // dsa_group_num) * L
+        row_depth_starts = (o_q // moda_group_num) * L
         query_row_ids = o_q
 
         base_k_cached = cached_k + (bos_cached * H + i_h) * K
@@ -221,7 +221,7 @@ def parallel_fda_fwd_kernel(
             col_mask = depth_col_ids[None, :] < depth_block_end
 
             row_match_mask = (
-                depth_row_ids[None, :] == (query_row_ids // dsa_group_num)[:, None]
+                depth_row_ids[None, :] == (query_row_ids // moda_group_num)[:, None]
             )
 
             mask_depth = row_mask & col_mask & row_match_mask
@@ -265,7 +265,7 @@ def parallel_fda_fwd(
     cu_seqlens: Optional[torch.LongTensor] = None,
     cached_k: Optional[torch.Tensor] = None,
     cached_v: Optional[torch.Tensor] = None,
-    dsa_group_num: int = 1,
+    moda_group_num: int = 1,
     customized_BT: int = None,
     customized_BS: int = None,
     customized_BK: int = None,
@@ -273,9 +273,9 @@ def parallel_fda_fwd(
     customized_num_warps: int = None,
 ):
     B, TQ, HQ, K = q.shape
-    assert dsa_group_num > 0, "dsa_group_num must be positive"
-    assert TQ % dsa_group_num == 0, "T_q must be divisible by dsa_group_num"
-    T_kv = TQ // dsa_group_num
+    assert moda_group_num > 0, "moda_group_num must be positive"
+    assert TQ % moda_group_num == 0, "T_q must be divisible by moda_group_num"
+    T_kv = TQ // moda_group_num
     BT = 128
 
     assert (
@@ -284,7 +284,13 @@ def parallel_fda_fwd(
 
     H = cached_k.shape[2]
     V = cached_v.shape[-1]
-    assert HQ % H == 0, "HQ must be an integer multiple of H"
+    # Disallow implicit head-dimension GQA.
+    # All grouping must be expressed through `moda_group_num`.
+    assert HQ == H, (
+        "Implicit head-dimension GQA is not allowed. "
+        "Please fold grouping only into `moda_group_num`: "
+        "use q.shape[2] == cached_k.shape[2] and set T_q = T_kv * moda_group_num."
+    )
     G = HQ // H
 
     assert cached_k.shape[0] == B and cached_v.shape[0] == B
@@ -349,8 +355,8 @@ def parallel_fda_fwd(
         print("Target GPU is not optimized")
 
     assert (
-        BT % dsa_group_num == 0
-    ), "To keep depth alignment consistent with backward, BT % dsa_group_num must be 0"
+        BT % moda_group_num == 0
+    ), "To keep depth alignment consistent with backward, BT % moda_group_num must be 0"
 
     NK = triton.cdiv(K, BK)
     NV = triton.cdiv(V, BV)
@@ -374,7 +380,7 @@ def parallel_fda_fwd(
         cached_k=cached_k,
         cached_v=cached_v,
         L=L,
-        dsa_group_num=dsa_group_num,
+        moda_group_num=moda_group_num,
         scale=scale,
         cu_seqlens=cu_seqlens,
         chunk_indices=chunk_indices,
@@ -443,7 +449,7 @@ def parallel_fda_bwd_kernel_dq(
     cached_k,
     cached_v,
     L,
-    dsa_group_num,
+    moda_group_num,
     scale,
     cu_seqlens,
     chunk_indices,
@@ -483,7 +489,7 @@ def parallel_fda_bwd_kernel_dq(
         eos = bos + T_q
         q_block_index = i_t
 
-    T_kv = T_q // dsa_group_num
+    T_kv = T_q // moda_group_num
 
     RCP_LN2: tl.constexpr = 1.4426950216
 
@@ -557,7 +563,7 @@ def parallel_fda_bwd_kernel_dq(
     q_block_start = q_block_index * BT
     q_block_end = tl.minimum((q_block_index + 1) * BT, T_q)
     o_q = q_block_start + tl.arange(0, BT)
-    o_q_base = o_q // dsa_group_num
+    o_q_base = o_q // moda_group_num
 
     if USE_DEPTH:
 
@@ -566,8 +572,8 @@ def parallel_fda_bwd_kernel_dq(
         row_valid = o_q < T_q
         valid_rows = tl.minimum(BT, T_q - q_block_start)
 
-        base_rows_start = q_block_start // dsa_group_num
-        base_rows_end = (q_block_start + valid_rows - 1) // dsa_group_num + 1
+        base_rows_start = q_block_start // moda_group_num
+        base_rows_end = (q_block_start + valid_rows - 1) // moda_group_num + 1
         base_rows_end = tl.minimum(base_rows_end, T_kv)
 
         depth_block_start = base_rows_start * L
@@ -655,7 +661,7 @@ def parallel_fda_bwd_kernel_dkdv(
     d_cached_k,
     d_cached_v,
     L,
-    dsa_group_num,
+    moda_group_num,
     T_q,
     T_kv,
     scale,
@@ -696,10 +702,10 @@ def parallel_fda_bwd_kernel_dkdv(
 
     o_q = q_block_start + tl.arange(0, BT)
     row_valid = o_q < T_q
-    o_q_base = o_q // dsa_group_num
+    o_q_base = o_q // moda_group_num
 
-    base_rows_start = q_block_start // dsa_group_num
-    base_rows_end = (q_block_end - 1) // dsa_group_num + 1
+    base_rows_start = q_block_start // moda_group_num
+    base_rows_end = (q_block_end - 1) // moda_group_num + 1
     base_rows_end = tl.minimum(base_rows_end, T_kv)
 
     depth_block_start = base_rows_start * L
@@ -883,7 +889,7 @@ def parallel_fda_bwd(
     cu_seqlens: Optional[torch.LongTensor] = None,
     cached_k: Optional[torch.Tensor] = None,
     cached_v: Optional[torch.Tensor] = None,
-    dsa_group_num: int = 1,
+    moda_group_num: int = 1,
     customized_BT: int = None,
     customized_BS: int = None,
     customized_BK: int = None,
@@ -903,8 +909,8 @@ def parallel_fda_bwd(
     H = cached_k.shape[2]
     V = cached_v.shape[-1]
     T_q = q.shape[1]
-    assert T_q % dsa_group_num == 0, "T_q must be divisible by dsa_group_num"
-    T_kv = T_q // dsa_group_num
+    assert T_q % moda_group_num == 0, "T_q must be divisible by moda_group_num"
+    T_kv = T_q // moda_group_num
     assert cached_k.shape[0] == B and cached_v.shape[0] == B
     assert (
         cached_k.shape[1] % T_kv == 0 and cached_v.shape[1] % T_kv == 0
@@ -1063,7 +1069,7 @@ def parallel_fda_bwd(
             cached_k=cached_k,
             cached_v=cached_v,
             L=L,
-            dsa_group_num=dsa_group_num,
+            moda_group_num=moda_group_num,
             scale=scale,
             cu_seqlens=cu_seqlens,
             chunk_indices=chunk_indices,
@@ -1096,7 +1102,7 @@ def parallel_fda_bwd(
             d_cached_k=d_cached_k,
             d_cached_v=d_cached_v,
             L=L,
-            dsa_group_num=dsa_group_num,
+            moda_group_num=moda_group_num,
             T_q=T_q,
             T_kv=T_kv,
             scale=scale,
@@ -1139,13 +1145,13 @@ def naive_depth_causal_ref(
     kd: torch.Tensor,
     vd: torch.Tensor,
     scale: Optional[float] = None,
-    dsa_group_num: int = 1,
+    moda_group_num: int = 1,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """
     Flash Depth Attention torch reference.
 
     For each query position t_q:
-      base_t = t_q // dsa_group_num
+      base_t = t_q // moda_group_num
       softmax is computed only over the L depth tokens corresponding to base_t.
     """
     assert q.ndim == 4, "q must be [B, T_q, H, K]"
@@ -1157,9 +1163,9 @@ def naive_depth_causal_ref(
     Bvd, TLvd, Hvd, Vdim = vd.shape
     assert (Bkd, Hkd, Kkd) == (Bq, Hq, Kq)
     assert (Bvd, TLvd, Hvd) == (Bq, TLkd, Hq)
-    assert dsa_group_num > 0 and T_q % dsa_group_num == 0
+    assert moda_group_num > 0 and T_q % moda_group_num == 0
 
-    T_kv = T_q // dsa_group_num
+    T_kv = T_q // moda_group_num
     assert TLkd % T_kv == 0
     L = TLkd // T_kv
     assert L > 0
@@ -1181,7 +1187,7 @@ def naive_depth_causal_ref(
             vd_bh = vd_reshaped[b, :, :, h].to(torch.float32)
             for t_q_idx in range(T_q):
                 q_vec = q_bh[t_q_idx]
-                base_t = t_q_idx // dsa_group_num
+                base_t = t_q_idx // moda_group_num
                 logits = (kd_bh[base_t] @ q_vec) * scale
                 w = torch.softmax(logits, dim=0)
                 out[b, t_q_idx, h] = (w.unsqueeze(1) * vd_bh[base_t]).sum(0)
@@ -1213,7 +1219,7 @@ class ParallelFlashDepthAttentionFunction(torch.autograd.Function):
         cu_seqlens: Optional[torch.Tensor],
         cached_k: Optional[torch.Tensor] = None,
         cached_v: Optional[torch.Tensor] = None,
-        dsa_group_num: int = 1,
+        moda_group_num: int = 1,
         group_bs: Optional[int] = None,
         group_warps: Optional[int] = None,
         depth_bs: Optional[int] = None,
@@ -1240,7 +1246,7 @@ class ParallelFlashDepthAttentionFunction(torch.autograd.Function):
             cu_seqlens=cu_seqlens,
             cached_k=cached_k,
             cached_v=cached_v,
-            dsa_group_num=dsa_group_num,
+            moda_group_num=moda_group_num,
         )
 
         ctx.save_for_backward(
@@ -1258,7 +1264,7 @@ class ParallelFlashDepthAttentionFunction(torch.autograd.Function):
         ctx.num_saved_no_depth = 4
         ctx.scale = scale
         ctx.cu_seqlens = cu_seqlens
-        ctx.dsa_group_num = dsa_group_num
+        ctx.moda_group_num = moda_group_num
         ctx.has_g = g is not None
         ctx.dtype = q.dtype
 
@@ -1290,7 +1296,7 @@ class ParallelFlashDepthAttentionFunction(torch.autograd.Function):
             cu_seqlens=ctx.cu_seqlens,
             cached_k=cached_k,
             cached_v=cached_v,
-            dsa_group_num=ctx.dsa_group_num,
+            moda_group_num=ctx.moda_group_num,
             group_bs=ctx.group_bs,
             group_warps=ctx.group_warps,
             depth_bs=ctx.depth_bs,
@@ -1305,7 +1311,7 @@ class ParallelFlashDepthAttentionFunction(torch.autograd.Function):
 
         d_scale = None
         d_cu = None
-        d_dsa = None
+        d_moda = None
         d_group_bs = None
         d_group_warps = None
         d_depth_bs = None
@@ -1324,7 +1330,7 @@ class ParallelFlashDepthAttentionFunction(torch.autograd.Function):
             d_cu,
             d_cached_k,
             d_cached_v,
-            d_dsa,
+            d_moda,
             d_group_bs,
             d_group_warps,
             d_depth_bs,
@@ -1346,7 +1352,7 @@ def parallel_fda(
     cached_v: Optional[torch.Tensor] = None,
     scale: Optional[float] = None,
     cu_seqlens: Optional[torch.LongTensor] = None,
-    dsa_group_num: int = 1,
+    moda_group_num: int = 1,
     head_first: bool = False,
     need_lse: bool = False,
     return_depth_grads: bool = True,
@@ -1384,20 +1390,26 @@ def parallel_fda(
     assert (
         cached_k is not None and cached_v is not None
     ), "Flash Depth Attention requires cached_k/cached_v"
-    assert dsa_group_num > 0
-    assert T_q % dsa_group_num == 0, "T_q must be divisible by dsa_group_num"
-    T_kv = T_q // dsa_group_num
+    assert moda_group_num > 0
+    assert T_q % moda_group_num == 0, "T_q must be divisible by moda_group_num"
+    T_kv = T_q // moda_group_num
     H = cached_k.shape[2]
-    assert HQ % H == 0, "HQ must be an integer multiple of H (GQA)"
+    # Disallow implicit head-dimension GQA.
+    # All grouping must be expressed through `moda_group_num`.
+    assert HQ == H, (
+        "Implicit head-dimension GQA is not allowed. "
+        "Please fold grouping only into `moda_group_num`: "
+        "use q.shape[2] == cached_k.shape[2] and set T_q = T_kv * moda_group_num."
+    )
     if scale is None:
         scale = Kdim ** -0.5
 
-    if dsa_group_num > 1:
+    if moda_group_num > 1:
         assert (
-            T_q == T_kv * dsa_group_num
-        ), "When dsa_group_num > 1, T_q must equal T_kv * dsa_group_num"
+            T_q == T_kv * moda_group_num
+        ), "When moda_group_num > 1, T_q must equal T_kv * moda_group_num"
     else:
-        assert T_q == T_kv, "When dsa_group_num=1, T_q must equal T_kv"
+        assert T_q == T_kv, "When moda_group_num=1, T_q must equal T_kv"
 
     assert cached_k.shape[0] == B and cached_v.shape[0] == B
     assert (
@@ -1424,7 +1436,7 @@ def parallel_fda(
         cu_seqlens,
         cached_k,
         cached_v,
-        dsa_group_num,
+        moda_group_num,
         group_bs,
         group_warps,
         depth_bs,
@@ -1481,15 +1493,15 @@ def test_once(
     seed=0,
     device="cuda",
     L: int = 64,
-    dsa_group_num: int = 1,
+    moda_group_num: int = 1,
 ):
     assert L > 0
     torch.manual_seed(seed)
     print(
-        f"\n==== Test B={B} T={T} H={H} K={K} V={V} L={L} dtype={dtype} dsa_group_num={dsa_group_num} ===="
+        f"\n==== Test B={B} T={T} H={H} K={K} V={V} L={L} dtype={dtype} moda_group_num={moda_group_num} ===="
     )
 
-    TQ = T * dsa_group_num
+    TQ = T * moda_group_num
     HQ = H
     scale = 1.0 / math.sqrt(K)
 
@@ -1498,7 +1510,7 @@ def test_once(
     vd = torch.randn(B, T * L, H, V, dtype=dtype, device=device)
 
     ref_out, ref_lse = naive_depth_causal_ref(
-        q, kd=kd, vd=vd, scale=scale, dsa_group_num=dsa_group_num
+        q, kd=kd, vd=vd, scale=scale, moda_group_num=moda_group_num
     )
 
     out_impl, lse_impl = parallel_fda_fwd(
@@ -1508,7 +1520,7 @@ def test_once(
         cu_seqlens=None,
         cached_k=kd,
         cached_v=vd,
-        dsa_group_num=dsa_group_num,
+        moda_group_num=moda_group_num,
     )
 
     out_impl_f32 = out_impl.float()
@@ -1527,7 +1539,7 @@ def test_dkv_backward_depth(
     K=64,
     V=64,
     L=64,
-    dsa_group_num=1,
+    moda_group_num=1,
     dtype=torch.float16,
     device="cuda",
     seed=0,
@@ -1536,9 +1548,9 @@ def test_dkv_backward_depth(
     torch.manual_seed(seed)
     print(
         f"\n==== DKV DEPTH TEST B={B} T_kv={T_kv} H={H} K={K} V={V} L={L} "
-        f"dsa_group_num={dsa_group_num} dtype={dtype} ===="
+        f"moda_group_num={moda_group_num} dtype={dtype} ===="
     )
-    T_q = T_kv * dsa_group_num
+    T_q = T_kv * moda_group_num
     scale = 1.0 / math.sqrt(K)
     q = torch.randn(B, T_q, H, K, dtype=dtype, device=device)
     kd = torch.randn(B, T_kv * L, H, K, dtype=dtype, device=device)
@@ -1551,7 +1563,7 @@ def test_dkv_backward_depth(
             cu_seqlens=None,
             cached_k=kd,
             cached_v=vd,
-            dsa_group_num=dsa_group_num,
+            moda_group_num=moda_group_num,
         )
     do = torch.randn_like(o_kernel)
     with torch.no_grad():
@@ -1565,13 +1577,13 @@ def test_dkv_backward_depth(
             cu_seqlens=None,
             cached_k=kd,
             cached_v=vd,
-            dsa_group_num=dsa_group_num,
+            moda_group_num=moda_group_num,
         )
     q_ref = q.detach().clone().requires_grad_(True)
     kd_ref = kd.detach().clone().requires_grad_(True)
     vd_ref = vd.detach().clone().requires_grad_(True)
     out_ref, _ = naive_depth_causal_ref(
-        q_ref, kd=kd_ref, vd=vd_ref, scale=scale, dsa_group_num=dsa_group_num
+        q_ref, kd=kd_ref, vd=vd_ref, scale=scale, moda_group_num=moda_group_num
     )
     loss = (out_ref * do).sum()
     loss.backward()
@@ -1588,18 +1600,18 @@ def test_dq_backward_depth(
     K=64,
     V=64,
     L=64,
-    dsa_group_num=1,
+    moda_group_num=1,
     dtype=torch.float16,
     device="cuda",
     seed=0,
 ):
     assert L > 0
     print(
-        f"\n==== DQ TEST (WITH DEPTH, dsa_group_num={dsa_group_num}) B={B} T_kv={T_kv} "
+        f"\n==== DQ TEST (WITH DEPTH, moda_group_num={moda_group_num}) B={B} T_kv={T_kv} "
         f"H={H} K={K} V={V} L={L} dtype={dtype} ===="
     )
     torch.manual_seed(seed)
-    T_q = T_kv * dsa_group_num
+    T_q = T_kv * moda_group_num
     scale = 1.0 / (K ** 0.5)
 
     q = torch.randn(B, T_q, H, K, dtype=dtype, device=device)
@@ -1613,7 +1625,7 @@ def test_dq_backward_depth(
             scale=scale,
             cached_k=kd,
             cached_v=vd,
-            dsa_group_num=dsa_group_num,
+            moda_group_num=moda_group_num,
         )
 
     do = torch.randn_like(o)
@@ -1628,14 +1640,14 @@ def test_dq_backward_depth(
             scale=scale,
             cached_k=kd,
             cached_v=vd,
-            dsa_group_num=dsa_group_num,
+            moda_group_num=moda_group_num,
         )
 
     q_ref = q.detach().clone().requires_grad_(True)
     kd_ref = kd.detach()
     vd_ref = vd.detach()
     out_ref, _ = naive_depth_causal_ref(
-        q_ref, kd=kd_ref, vd=vd_ref, scale=scale, dsa_group_num=dsa_group_num
+        q_ref, kd=kd_ref, vd=vd_ref, scale=scale, moda_group_num=moda_group_num
     )
     loss = (out_ref * do).sum()
     loss.backward()
@@ -1651,18 +1663,18 @@ def run_case(
     K=32,
     V=32,
     L=4,
-    dsa_group_num=1,
+    moda_group_num=1,
     device="cuda",
     dtype=torch.float32,
     seed=0,
 ):
     assert L > 0
     torch.manual_seed(seed)
-    T_q = T_kv * dsa_group_num
+    T_q = T_kv * moda_group_num
     print(f"\n=== {case_name} ===")
     print(
         f"B={B}, T_kv={T_kv}, T_q={T_q}, H={H}, K={K}, V={V}, L={L}, "
-        f"group={dsa_group_num}, dtype={dtype}"
+        f"group={moda_group_num}, dtype={dtype}"
     )
 
     q = torch.randn(B, T_q, H, K, device=device, dtype=dtype, requires_grad=True)
@@ -1688,7 +1700,7 @@ def run_case(
         cached_v=vd_kernel,
         scale=scale,
         cu_seqlens=None,
-        dsa_group_num=dsa_group_num,
+        moda_group_num=moda_group_num,
         head_first=False,
         need_lse=False,
     )
@@ -1706,7 +1718,7 @@ def run_case(
         kd=kd_ref,
         vd=vd_ref,
         scale=scale,
-        dsa_group_num=dsa_group_num,
+        moda_group_num=moda_group_num,
     )
     loss_ref = (out_ref * grad_out).sum()
     loss_ref.backward()
@@ -1799,7 +1811,7 @@ def run_one_case(
                 cu_seqlens=None,
                 cached_k=cached_k,
                 cached_v=cached_v,
-                dsa_group_num=group,
+                moda_group_num=group,
                 customized_BT=customized_BT,
                 customized_BS=customized_BS,
             )
@@ -1812,7 +1824,7 @@ def run_one_case(
                 kd=cached_k,
                 vd=cached_v,
                 scale=scale,
-                dsa_group_num=group,
+                moda_group_num=group,
             )
 
     else:
@@ -1872,7 +1884,7 @@ def run_one_case_bwd(
                 cu_seqlens=None,
                 cached_k=cached_k,
                 cached_v=cached_v,
-                dsa_group_num=group,
+                moda_group_num=group,
                 customized_BT=customized_BT,
                 customized_BS=customized_BS,
             )
@@ -1885,7 +1897,7 @@ def run_one_case_bwd(
                 kd=cached_k,
                 vd=cached_v,
                 scale=scale,
-                dsa_group_num=group,
+                moda_group_num=group,
             )
             return out
 
@@ -2079,7 +2091,7 @@ def _run_single_method(
 
         def fwd_fn():
             out, _ = naive_depth_causal_ref(
-                q=q, kd=kd, vd=vd, scale=scale, dsa_group_num=G
+                q=q, kd=kd, vd=vd, scale=scale, moda_group_num=G
             )
             return out
 
@@ -2091,7 +2103,7 @@ def _run_single_method(
             return parallel_fda(
                 q=q, k=None, v=None, g=None, scale=scale,
                 cu_seqlens=None, cached_k=kd, cached_v=vd,
-                dsa_group_num=G,
+                moda_group_num=G,
             )
 
         grad_tensors = [q, kd, vd]
@@ -2190,7 +2202,7 @@ if __name__ == "__main__":
         K=64,
         V=64,
         L=4,
-        dsa_group_num=1,
+        moda_group_num=1,
         device=device,
         dtype=torch.float16,
         seed=0,
@@ -2204,7 +2216,7 @@ if __name__ == "__main__":
         K=64,
         V=64,
         L=4,
-        dsa_group_num=1,
+        moda_group_num=1,
         device=device,
         dtype=torch.float16,
         seed=1,
@@ -2218,7 +2230,7 @@ if __name__ == "__main__":
         K=64,
         V=64,
         L=72,
-        dsa_group_num=2,
+        moda_group_num=2,
         device=device,
         dtype=torch.float16,
         seed=2,

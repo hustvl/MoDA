@@ -399,6 +399,13 @@ def parallel_moda_fwd(
     T_kv = T
     TQ = q.shape[1]
     HQ = q.shape[2]
+    # Disallow implicit head-dimension GQA.
+    # All grouping must be expressed through `moda_group_num`.
+    assert HQ == H, (
+        "Implicit head-dimension GQA is not allowed. "
+        "Please fold grouping only into `moda_group_num`: "
+        "use q.shape[2] == k.shape[2] and set T_q = T_kv * moda_group_num."
+    )
     G = HQ // H
     BT = 128
 
@@ -1490,6 +1497,13 @@ def parallel_moda_bwd(
     B, T_kv, H, K, V = *k.shape, v.shape[-1]
     T_q = q.shape[1]
     HQ = q.shape[2]
+    # Disallow implicit head-dimension GQA.
+    # All grouping must be expressed through `moda_group_num`.
+    assert HQ == H, (
+        "Implicit head-dimension GQA is not allowed. "
+        "Please fold grouping only into `moda_group_num`: "
+        "use q.shape[2] == k.shape[2] and set T_q = T_kv * moda_group_num."
+    )
     assert T_q % moda_group_num == 0, "T_q must be divisible by moda_group_num"
     assert (
         T_kv == T_q // moda_group_num
@@ -2820,7 +2834,13 @@ def parallel_moda(
     B, T_q, HQ, Kdim = q.shape
     T_kv = k.shape[1]
     H = k.shape[2]
-    assert HQ % H == 0, "HQ must be an integer multiple of H (GQA)"
+    # Disallow implicit head-dimension GQA.
+    # All grouping must be expressed through `moda_group_num`.
+    assert HQ == H, (
+        "Implicit head-dimension GQA is not allowed. "
+        "Please fold grouping only into `moda_group_num`: "
+        "use q.shape[2] == k.shape[2] and set T_q = T_kv * moda_group_num."
+    )
     if scale is None:
         scale = Kdim**-0.5
 

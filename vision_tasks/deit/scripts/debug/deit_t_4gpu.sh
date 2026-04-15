@@ -2,7 +2,7 @@
 set -euo pipefail
 
 SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
-DEIT_DIR=$(cd "${SCRIPT_DIR}/.." && pwd)
+DEIT_DIR=$(cd "${SCRIPT_DIR}/../.." && pwd)
 PYTHON_BIN=/mnt/bn/ic-vlm/lianghuizhu/miniconda3/envs/deit/bin/python
 DATA_PATH=/mnt/bn/ic-vlm/zilonghuang/Imagenet1k
 MODEL_NAME=deit_tiny_patch16_224
