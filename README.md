@@ -16,11 +16,13 @@ ArXiv Preprint ([arXiv 2603.15619](https://arxiv.org/abs/2603.15619)), Blog ([Th
 
 ## News
 
-* **` Mar. 16th, 2026`:** We released the *Mixture-of-Depths Attention* paper on arXiv. Code is available now.
+* **` Apr. 12th, 2026`:** We released the `The Second Half of Model Architecture` blog. We **highly recommend** reading the blog first!
+* **` Mar. 16th, 2026`:** We released the `Mixture-of-Depths Attention` paper on arXiv. Code is available now.
 
 ## TODO
 
-- [x] Release Mixture-of-Depths Attention (MoDA) paper on arXiv.
+- [x] Release [Mixture-of-Depths Attention (MoDA)](https://arxiv.org/abs/2603.15619) paper on arXiv.
+- [x] Release [The Second Half of Model Architecture](https://lh-zhu.github.io/The-Second-Half-of-Model-Architecture/) blog.
 - [x] Release [MoDA Triton kernel](libs/moda_triton/fla/ops/moda/moda_v14.py) and corresponding test units.
 - [x] Release [Chunk-Visible MoDA Triton kernel](libs/moda_triton/fla/ops/moda/moda_v16.py) and corresponding test units.
 - [x] Release [FDA (Flash Depth Attention) Triton kernel](libs/moda_triton/fla/ops/moda/fda_v12.py) and corresponding test units.
