@@ -26,7 +26,7 @@ ArXiv Preprint ([arXiv 2603.15619](https://arxiv.org/abs/2603.15619)), Blog ([Th
 - [x] Release [FDA (Flash Depth Attention) Triton kernel](libs/moda_triton/fla/ops/moda/fda_v12.py) and corresponding test units.
 - [x] Release [Non-Causal MoDA Triton kernel](libs/moda_triton/fla/ops/moda/moda_v14.py) and corresponding test units, note that you only need pass `is_causal=False` to the functions.
 - [ ] Release full LLM training recipe and reproducible configs.
-- [ ] Release full vision tasks training recipe, i.e., Classification on ImageNet.
+- [x] Release full vision tasks training recipe, i.e., [Classification on ImageNet](vision_tasks/deit).
 
 ## Abstract
 
@@ -144,9 +144,16 @@ cd ../..
 python3 libs/moda_triton/fla/ops/moda/moda_v14.py
 ```
 
+## Try MoDA on Vision Tasks, i.e., [Classification on ImageNet](vision_tasks/deit)
+
+```sh
+cd vision_tasks/deit
+bash scripts/train/deit_t_moda_4gpu.sh
+```
+
 ## Acknowledgement :heart:
 
-This project is based on [OLMo2](https://github.com/allenai/OLMo) ([paper](https://arxiv.org/abs/2501.00656)) and [Flash Linear Attention](https://github.com/fla-org/flash-linear-attention) ([paper](https://arxiv.org/abs/2312.06635)). Thanks for their wonderful works.
+This project is based on [OLMo2](https://github.com/allenai/OLMo) ([paper](https://arxiv.org/abs/2501.00656)), [DeiT](https://github.com/facebookresearch/deit) ([paper](https://arxiv.org/abs/2012.12877)) and [Flash Linear Attention](https://github.com/fla-org/flash-linear-attention) ([paper](https://arxiv.org/abs/2312.06635)). Thanks for their wonderful works.
 
 ## Citation
 
