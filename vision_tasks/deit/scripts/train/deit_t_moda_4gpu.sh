@@ -9,6 +9,10 @@ pip3 install .
 
 cd /opt/tiger/MoDA/vision_tasks/deit
 
+# triton 3.6.0 on Hopper (sm90) GPU, when compiling the parallel_attn_bwd_kernel_dkv_depth kernel, the MLIR pass pipeline internally crashes.
+# [fix] we downgrade to triton 3.3.0 to avoid the issue.
+pip3 install triton==3.3.0
+
 set -euo pipefail
 
 # check the available storage mount in order
@@ -28,6 +32,7 @@ DEIT_DIR=$(cd "${SCRIPT_DIR}/../.." && pwd)
 PYTHON_BIN=python3
 MODEL_NAME=deit_tiny_moda_patch16_224
 OUTPUT_DIR=${OUTPUT_ROOT}/${MODEL_NAME}
+
 
 cd "${DEIT_DIR}"
 "${PYTHON_BIN}" -m torch.distributed.run --nproc_per_node=4 --master_port 49501 main.py --model "${MODEL_NAME}" --batch-size 256 --data-path "${DATA_PATH}" --output_dir "${OUTPUT_DIR}"
