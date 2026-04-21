@@ -8,7 +8,9 @@ Lianghui Zhu<sup>1,2</sup>, Yuxin Fang<sup>2,&dagger;</sup>, Bencheng Liao<sup>1
 
 (<sup>&dagger;</sup>) project lead, (<sup>#</sup>) corresponding author.
 
-Paper ([arXiv 2603.15619](https://arxiv.org/abs/2603.15619)), Blog ([The Second Half of Model Architecture](https://lh-zhu.github.io/The-Second-Half-of-Model-Architecture/) · [中文版 / Chinese version](https://mp.weixin.qq.com/s/Ynt7xQTg5wWAf64Szup4Gg) ）, X / Twitter ([Post](https://x.com/lianghui_zhu/status/2045868757869080695))
+Paper ([arXiv 2603.15619](https://arxiv.org/abs/2603.15619)), X / Twitter ([Post](https://x.com/lianghui_zhu/status/2045868757869080695)),
+
+Blog ([The Second Half of Model Architecture](https://lh-zhu.github.io/The-Second-Half-of-Model-Architecture/) · [中文版 / Chinese version](https://mp.weixin.qq.com/s/Ynt7xQTg5wWAf64Szup4Gg) ）
 
 </div>
 
