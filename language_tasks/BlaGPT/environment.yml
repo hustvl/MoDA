@@ -1,0 +1,19 @@
+name: blagpt
+channels:
+  - pytorch
+  - nvidia
+  - conda-forge
+dependencies:
+  - python=3.11
+  - pytorch=2.5.0
+  - torchvision=0.20.0
+  - torchaudio=2.5.0
+  - pytorch-cuda=12.4
+  - pip
+  - pip:
+    - huggingface_hub
+    - transformers
+    - tiktoken
+    - datasets
+    - coqpit
+    - sympy==1.13.1
