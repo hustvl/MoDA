@@ -1,0 +1,19 @@
+# Local experiment notes / audit reports. These are scratch artifacts
+# we generate while iterating on training efficiency, kernel parity, and
+# similar audits -- they are not part of the project's official docs and
+# should not be committed.
+experiment_notes/
+
+# Per-project ``benchmark/`` folders hold the microbench / profiling
+# scripts we wrote for those audits (they are companions to the gitignored
+# experiment_notes/ docs). They are scratch tooling, not production
+# entry-points, so they don't ship with the repo.
+language_tasks/BlaGPT/bla_gpt/benchmark/
+vision_tasks/deit/benchmark/
+
+# Per-project ``tests/`` folders hold the equivalence / parity test
+# scripts we wrote alongside the benchmarks (e.g. v14 vs v17 numerical
+# parity, cache_post_norm_k equiv). Same scratch-tooling treatment as
+# benchmark/.
+language_tasks/BlaGPT/bla_gpt/tests/
+vision_tasks/deit/tests/

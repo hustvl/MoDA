@@ -41,6 +41,30 @@ def get_args_parser():
                         help='Name of model to train')
     parser.add_argument('--input-size', default=224, type=int, help='images input size')
 
+    # MoDA-specific: depth-cache backend. ``v17`` is the production default
+    # (O(L) cache build, ~12-17% lower peak memory, bit-identical to ``v14``);
+    # ``v14`` is retained for parity / regression testing only. The flag is
+    # ignored for non-MoDA models because ``create_model``'s **kwargs path
+    # passes it as a kwarg to the model factory; non-MoDA factories swallow
+    # it via ``**kwargs``.
+    parser.add_argument('--moda-backend', default='v17', type=str, choices=['v14', 'v17'],
+                        help='MoDA depth-cache backend (only used by MoDA models, default: v17)')
+    # ``--mlp-depth-kv-projection`` toggles the BlaGPT-style "dual slot per
+    # layer" cache layout. When enabled (default) each MoDA block writes
+    # *two* slots to the depth cache (one from attention, one from the
+    # MLP's extra ``kv_proj`` Linear); when disabled the MLP is a vanilla
+    # timm ``Mlp`` and only attention writes a slot. This changes the
+    # parameter count and the model identity, so checkpoints are not
+    # interchangeable across this flag. Like ``--moda-backend`` it is only
+    # forwarded to MoDA factories.
+    parser.add_argument('--mlp-depth-kv-projection', dest='mlp_depth_kv_projection',
+                        action='store_true',
+                        help='Enable MoDA MLP depth K/V projection (default: enabled)')
+    parser.add_argument('--no-mlp-depth-kv-projection', dest='mlp_depth_kv_projection',
+                        action='store_false',
+                        help='Disable MoDA MLP depth K/V projection (single-slot-per-layer cache)')
+    parser.set_defaults(mlp_depth_kv_projection=True)
+
     parser.add_argument('--drop', type=float, default=0.0, metavar='PCT',
                         help='Dropout rate (default: 0.)')
     parser.add_argument('--drop-path', type=float, default=0.1, metavar='PCT',
@@ -260,6 +284,14 @@ def main(args):
             label_smoothing=args.smoothing, num_classes=args.nb_classes)
 
     print(f"Creating model: {args.model}")
+    extra_model_kwargs = {}
+    # Only forward ``moda_backend`` to MoDA factories. Stock timm VisionTransformer
+    # does not accept it and would raise TypeError if injected unconditionally.
+    if 'moda' in args.model:
+        extra_model_kwargs['moda_backend'] = args.moda_backend
+        extra_model_kwargs['mlp_depth_kv_projection'] = args.mlp_depth_kv_projection
+        print(f"  moda_backend = {args.moda_backend}")
+        print(f"  mlp_depth_kv_projection = {args.mlp_depth_kv_projection}")
     model = create_model(
         args.model,
         pretrained=False,
@@ -267,7 +299,8 @@ def main(args):
         drop_rate=args.drop,
         drop_path_rate=args.drop_path,
         drop_block_rate=None,
-        img_size=args.input_size
+        img_size=args.input_size,
+        **extra_model_kwargs,
     )
 
                     
@@ -342,7 +375,23 @@ def main(args):
 
     model_without_ddp = model
     if args.distributed:
-        model = torch.nn.parallel.DistributedDataParallel(model, device_ids=[args.gpu])
+        # DDP perf knobs:
+        # * ``broadcast_buffers=False``: DeiT/MoDA models only contain LayerNorm
+        #   (no running buffers) and Parameter buffers, so the per-step buffer
+        #   broadcast is pure overhead. ``ModelEma`` lives in its own
+        #   non-DDP-wrapped instance and is unaffected by this flag.
+        # * ``gradient_as_bucket_view=True``: avoids one full-sized grad memcpy
+        #   per backward and lowers peak memory. Standard recipe for ViT
+        #   training when no FSDP/ZeRO is in play.
+        # ``find_unused_parameters`` defaults to ``False`` already, which is
+        # correct for both v14 and v17 MoDA paths (every parameter receives a
+        # gradient on every step).
+        model = torch.nn.parallel.DistributedDataParallel(
+            model,
+            device_ids=[args.gpu],
+            broadcast_buffers=False,
+            gradient_as_bucket_view=True,
+        )
         model_without_ddp = model.module
     n_parameters = sum(p.numel() for p in model.parameters() if p.requires_grad)
     print('number of params:', n_parameters)

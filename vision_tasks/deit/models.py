@@ -345,7 +345,47 @@ class MoDAAttention(nn.Module):
         k = k.contiguous()
         v = v.contiguous()
 
+        # Autocast can leave ``q`` / ``k`` / ``v`` as bf16 (Linear is
+        # autocasted) while ``depth_k`` / ``depth_v`` -- which were allocated
+        # with ``dtype=x.dtype`` in ``_forward_blocks_v17`` *before* the
+        # patch_embed Conv2d's autocast applied -- stay fp32. The kernel
+        # requires identical dtypes for ``q`` and ``cached_k`` (its
+        # ``tl.dot(b_q, b_k_depth)`` raises ``Both operands must be same
+        # dtype`` otherwise). ``Tensor.to(self.dtype)`` is a no-op when the
+        # dtype already matches, so this is free in the matched case and
+        # safe under any future precision changes.
+        if depth_k is not None:
+            depth_k = depth_k.to(q.dtype)
+            depth_v = depth_v.to(q.dtype)
+
+        # ``is_causal=False``: ViT spatial attention is fully bidirectional
+        # (every patch attends to every other patch). The kernel applies
+        # ``is_causal`` only to the *spatial* K/V branch (the
+        # ``o_q_base >= o_k`` mask in ``parallel_moda_fwd_kernel``); the
+        # depth K/V branch (``cached_k`` / ``cached_v``) is *unconditionally*
+        # masked by ``row_match_mask`` (each query token only attends to its
+        # own history slots) and ``slot_valid_mask`` (``slot_in_token <
+        # L_cur``), so layer-dimension "causality" is enforced by the
+        # forward-pass scheduling -- it does not piggyback on this flag.
+        # If we mistakenly passed ``is_causal=True`` here, the kernel would
+        # zero out the upper triangle of spatial attention and patch j
+        # could no longer see patch j+1..N-1, which is wrong for ViT.
         if self.moda_backend == "v17":
+            # ``depth_bs`` / ``depth_warps`` override the autotuner's default
+            # config for ``parallel_attn_bwd_kernel_dkv_depth`` (the depth
+            # pass of the backward). The library's per-GPU default for A100
+            # is ``(128, 8)``; in fp32 this needs ~192KB shared memory and
+            # exceeds A100 80GB's 163KB limit on small head-dim cases (see
+            # the same fix in ``bla_gpt_moda_depth_scaling.py``). In bf16
+            # the same config only uses ~96KB and runs ~2-4% faster than
+            # the safe ``(64, 4)`` H800 default, so we apply the override
+            # only when the kernel actually risks OOR (fp32 path). Real
+            # training is bf16 autocast and lets the autotuner pick.
+            kernel_extra = (
+                {"depth_bs": 64, "depth_warps": 4}
+                if q.dtype == torch.float32
+                else {}
+            )
             o = parallel_moda_v17(
                 q=q, k=k, v=v, g=None,
                 scale=self.scale, cu_seqlens=None,
@@ -353,6 +393,7 @@ class MoDAAttention(nn.Module):
                 moda_group_num=G, is_causal=False,
                 head_first=False, warn_shape=False,
                 current_depth=current_depth,
+                **kernel_extra,
             )
         else:
             o = parallel_moda(
@@ -370,10 +411,88 @@ class MoDAAttention(nn.Module):
         return x, k, v
 
 
+class MoDAMlp(nn.Module):
+    """DeiT-style MLP that *also* contributes a fresh (K, V) pair to the
+    depth cache (BlaGPT-style "dual-slot" MoDA layout).
+
+    The plain timm ``Mlp`` is augmented with an extra ``kv_proj`` whose
+    ``2 * num_kv_heads * head_dim`` output is reshaped into per-token
+    ``(k, v)`` of shape ``[B, N, num_kv_heads, head_dim]`` and returned
+    alongside the MLP output. The block / vision transformer is responsible
+    for routing those tensors into the depth buffer (v17) or the per-layer
+    list (v14).
+
+    Why the last block's ``kv_proj`` is stripped at construction time
+    (``is_last_layer=True``):
+      * In dual-slot mode the last block's MLP slot is ``2*L - 1`` (the
+        very last slot of the K1 v17 buffer), which no later attention
+        ever reads. Computing it is pure waste.
+      * It also leaves ``kv_proj.weight`` *outside* the autograd graph,
+        which trips DDP ``find_unused_parameters=False``. Stripping the
+        Linear keeps the parameter set clean.
+    """
+
+    def __init__(self, in_features, hidden_features, num_kv_heads, head_dim,
+                 act_layer=nn.GELU, drop=0., qkv_bias=True,
+                 use_depth_kv_projection=True, is_last_layer=False):
+        super().__init__()
+        out_features = in_features
+        self.fc1 = nn.Linear(in_features, hidden_features)
+        self.act = act_layer()
+        self.drop1 = nn.Dropout(drop)
+        self.fc2 = nn.Linear(hidden_features, out_features)
+        self.drop2 = nn.Dropout(drop)
+
+        self.num_kv_heads = num_kv_heads
+        self.head_dim = head_dim
+        # ``use_depth_kv_projection=False`` and ``is_last_layer=True`` both
+        # disable the kv_proj branch; the latter wins so we never allocate
+        # parameters that would land at an unread slot.
+        if use_depth_kv_projection and not is_last_layer:
+            self.kv_proj = nn.Linear(
+                in_features, 2 * num_kv_heads * head_dim, bias=qkv_bias
+            )
+        else:
+            self.kv_proj = None
+
+    def forward(self, x):
+        if self.kv_proj is not None:
+            B, N, _ = x.shape
+            kv = self.kv_proj(x).reshape(B, N, 2, self.num_kv_heads, self.head_dim)
+            # ``unbind`` returns non-contiguous views; we materialise once
+            # here so the kernel's ``@contiguous`` input_guard doesn't pay
+            # for the copy on every layer (mirrors MoDAAttention.forward).
+            k, v = kv.unbind(dim=2)
+            k = k.contiguous()
+            v = v.contiguous()
+        else:
+            k, v = None, None
+        out = self.fc1(x)
+        out = self.act(out)
+        out = self.drop1(out)
+        out = self.fc2(out)
+        out = self.drop2(out)
+        return out, k, v
+
+
 class MoDABlock(nn.Module):
+    """Transformer block with MoDA depth attention.
+
+    With ``mlp_depth_kv_projection=True`` (default), the MLP also produces
+    a per-token (k, v) pair via :class:`MoDAMlp`, and the block returns the
+    full ``(x, k_attn, v_attn, k_mlp, v_mlp)`` tuple so the parent
+    transformer can write *both* slots into the depth buffer (one for
+    attention, one for the MLP). This mirrors BlaGPT's
+    ``BlockPostNormMoDA`` / ``SwiGLUMLPDepthScalingMoDA`` design.
+
+    With ``mlp_depth_kv_projection=False``, the block falls back to the
+    timm ``Mlp`` (no extra projection) and returns ``(x, k_attn, v_attn,
+    None, None)`` -- this is the legacy "single-slot per layer" layout.
+    """
+
     def __init__(self, dim, num_heads, num_kv_heads, mlp_ratio=4., qkv_bias=False, drop=0., attn_drop=0.,
                  drop_path=0., act_layer=nn.GELU, norm_layer=nn.LayerNorm,
-                 moda_backend="v14"):
+                 moda_backend="v14", mlp_depth_kv_projection=True, is_last_layer=False):
         super().__init__()
         self.norm1 = norm_layer(dim)
         self.attn = MoDAAttention(
@@ -388,16 +507,31 @@ class MoDABlock(nn.Module):
         self.drop_path = DropPath(drop_path) if drop_path > 0. else nn.Identity()
         self.norm2 = norm_layer(dim)
         mlp_hidden_dim = int(dim * mlp_ratio)
-        self.mlp = Mlp(in_features=dim, hidden_features=mlp_hidden_dim, act_layer=act_layer, drop=drop)
+        self.mlp_depth_kv_projection = mlp_depth_kv_projection
+        if mlp_depth_kv_projection:
+            self.mlp = MoDAMlp(
+                in_features=dim, hidden_features=mlp_hidden_dim,
+                num_kv_heads=num_kv_heads, head_dim=dim // num_heads,
+                act_layer=act_layer, drop=drop, qkv_bias=qkv_bias,
+                use_depth_kv_projection=True,
+                is_last_layer=is_last_layer,
+            )
+        else:
+            self.mlp = Mlp(in_features=dim, hidden_features=mlp_hidden_dim, act_layer=act_layer, drop=drop)
 
     def forward(self, x, depth_k=None, depth_v=None, current_depth=None):
-        attn_out, k, v = self.attn(
+        attn_out, k_attn, v_attn = self.attn(
             self.norm1(x), depth_k=depth_k, depth_v=depth_v,
             current_depth=current_depth,
         )
         x = x + self.drop_path(attn_out)
-        x = x + self.drop_path(self.mlp(self.norm2(x)))
-        return x, k, v
+        if self.mlp_depth_kv_projection:
+            mlp_out, k_mlp, v_mlp = self.mlp(self.norm2(x))
+            x = x + self.drop_path(mlp_out)
+            return x, k_attn, v_attn, k_mlp, v_mlp
+        mlp_out = self.mlp(self.norm2(x))
+        x = x + self.drop_path(mlp_out)
+        return x, k_attn, v_attn, None, None
 
 
 class MoDAVisionTransformer(nn.Module):
@@ -406,25 +540,44 @@ class MoDAVisionTransformer(nn.Module):
     The ``moda_backend`` argument selects the depth-cache management
     strategy:
 
-    * ``"v14"`` (default, drop-in compatible) -- per-block ``torch.stack``
-      rebuild from a per-layer ``kv_list``. ``O(L^2 * BNHK)`` cache
-      construction bandwidth across the forward pass; full autograd
-      semantics straight out of PyTorch.
-    * ``"v17"`` -- the K1 plan: a single ``[B, N*depth, H, D]`` buffer is
-      pre-allocated once per forward pass; each block writes its new
-      ``[B, N, H, D]`` slice into a slot via ``_WriteDepthSlotKV``
-      (``O(BNHK)`` per block, ``O(L * BNHK)`` total). The K1 kernel
-      reads only the first ``current_depth`` slots per token. The
-      autograd graph is preserved (gradients flow from later layers'
-      depth attention back through the slot to the writing layer's
-      ``self.kv`` parameters), so v14 and v17 are bit-identical in both
-      forward and backward.
+    * ``"v14"`` -- per-block ``torch.stack`` rebuild from a per-layer
+      ``kv_list``. ``O(L^2 * BNHK)`` cache construction bandwidth across
+      the forward pass; full autograd semantics straight out of PyTorch.
+    * ``"v17"`` (recommended) -- the K1 plan: a single
+      ``[B, N*max_depth, H, D]`` buffer is pre-allocated once per forward
+      pass; each block writes its new ``[B, N, H, D]`` slice into a slot
+      via ``_WriteDepthSlotKV`` (``O(BNHK)`` per block,
+      ``O(slots * BNHK)`` total). The K1 kernel reads only the first
+      ``current_depth`` slots per token. The autograd graph is preserved
+      (gradients flow from later layers' depth attention back through
+      the slot to the writing layer's ``self.kv`` / MLP ``kv_proj``
+      parameters), so v14 and v17 are bit-identical in both forward and
+      backward.
+
+    The ``mlp_depth_kv_projection`` argument (default ``True``) controls
+    the per-layer cache layout:
+
+    * ``True`` (BlaGPT-style "dual slot per layer"): each block writes two
+      slots, one from attention and one from the MLP's ``kv_proj`` branch
+      (see :class:`MoDAMlp`). Total cache depth is ``2 * depth`` and the
+      MLP gains a learnable ``[in_features, 2 * num_kv_heads * head_dim]``
+      Linear per non-final block.
+    * ``False`` (legacy "single slot per layer"): only attention writes a
+      slot; the block uses the timm ``Mlp`` and the cache depth is
+      ``depth``. Useful for ablations / re-creating the original DeiT
+      MoDA experiments.
+
+    Within a fixed ``mlp_depth_kv_projection`` setting, ``v14`` and
+    ``v17`` produce numerically identical forward and backward outputs.
+    Different ``mlp_depth_kv_projection`` settings give different models
+    (extra parameters and an extra read row per layer), so checkpoints
+    are *not* interchangeable across this flag.
     """
 
     def __init__(self, img_size=224, patch_size=16, in_chans=3, num_classes=1000, embed_dim=768, depth=12,
                  num_heads=12, num_kv_heads=1, mlp_ratio=4., qkv_bias=True, drop_rate=0., attn_drop_rate=0.,
                  drop_path_rate=0., embed_layer=PatchEmbed, norm_layer=None, act_layer=None,
-                 moda_backend="v14", **kwargs):
+                 moda_backend="v14", mlp_depth_kv_projection=True, **kwargs):
         super().__init__()
         if moda_backend not in _MODA_BACKENDS:
             raise ValueError(
@@ -436,6 +589,16 @@ class MoDAVisionTransformer(nn.Module):
         self.num_kv_heads = num_kv_heads
         self.head_dim = embed_dim // num_heads
         self.moda_backend = moda_backend
+        # ``mlp_depth_kv_projection=True`` activates the BlaGPT-style "dual
+        # slot per layer" cache layout: each block writes 2 slots (one for
+        # attention, one for the MLP) instead of 1, giving the depth
+        # attention twice as many history rows to attend to per layer at
+        # the cost of an extra ``(2 * num_kv_heads * head_dim)`` Linear per
+        # block (last block excluded, see :class:`MoDAMlp`). Buffer / cache
+        # depth is ``depth * slots_per_layer``.
+        self.mlp_depth_kv_projection = mlp_depth_kv_projection
+        self.slots_per_layer = 2 if mlp_depth_kv_projection else 1
+        self.max_depth = depth * self.slots_per_layer
         norm_layer = norm_layer or partial(nn.LayerNorm, eps=1e-6)
         act_layer = act_layer or nn.GELU
 
@@ -465,6 +628,11 @@ class MoDAVisionTransformer(nn.Module):
                 norm_layer=norm_layer,
                 act_layer=act_layer,
                 moda_backend=moda_backend,
+                mlp_depth_kv_projection=mlp_depth_kv_projection,
+                # Last block's slot lands at ``max_depth - 1`` and is never
+                # read; :class:`MoDAMlp` skips its kv_proj entirely so the
+                # parameter stays out of the autograd graph (DDP-friendly).
+                is_last_layer=(i == depth - 1),
             )
             for i in range(depth)
         ])
@@ -519,27 +687,57 @@ class MoDAVisionTransformer(nn.Module):
 
     def _forward_blocks_v14(self, x):
         """v14 backend: per-block ``torch.stack`` rebuild from a per-layer
-        list. ``O(L^2 * BNHK)`` cache build bandwidth across the forward."""
+        list. ``O(slots^2 * BNHK)`` cache build bandwidth across the forward.
+
+        With ``mlp_depth_kv_projection=True`` each block appends *two*
+        entries to ``kv_list`` (attention's k/v then MLP's k/v); with
+        ``False`` it appends one. The last block's contributions are
+        intentionally dropped: no future attention reads them, so packing
+        them into the cache would only inflate the next layer's depth
+        attention -- but there is no next layer. (For the dual-slot case
+        the MLP's last-block ``kv_proj`` is also stripped at construction
+        time, so we never compute it in the first place.)
+        """
         kv_list = []
-        for blk in self.blocks:
+        n_layer = self.depth
+        for i, blk in enumerate(self.blocks):
             depth_k, depth_v = self._build_depth_cache(kv_list)
-            x, k, v = blk(x, depth_k=depth_k, depth_v=depth_v)
-            kv_list.append((k, v))
+            x, k_attn, v_attn, k_mlp, v_mlp = blk(x, depth_k=depth_k, depth_v=depth_v)
+            if i + 1 < n_layer:
+                kv_list.append((k_attn, v_attn))
+                if self.mlp_depth_kv_projection:
+                    # k_mlp / v_mlp are guaranteed non-None for non-final
+                    # blocks (MoDAMlp only strips kv_proj on the last layer).
+                    kv_list.append((k_mlp, v_mlp))
         return x
 
     def _forward_blocks_v17(self, x):
-        """v17 / K1 backend: pre-allocate one ``[B, N*depth, H, D]`` buffer
-        for the whole forward pass and write a single new slot per block.
-        ``O(L * BNHK)`` total cache-build bandwidth.
+        """v17 / K1 backend: pre-allocate one ``[B, N*max_depth, H, D]``
+        buffer for the whole forward pass and write per-block slot(s) in
+        place. ``O(slots * BNHK)`` total cache-build bandwidth.
+
+        Slot layout (dual-slot, ``mlp_depth_kv_projection=True``)::
+
+            block 0: attn -> slot 0, mlp  -> slot 1
+            block 1: attn -> slot 2, mlp  -> slot 3   (reads slots 0..1)
+            ...
+            block i: attn -> slot 2i,    mlp  -> slot 2i+1  (reads slots 0..2i-1)
+
+        Slot layout (single-slot, ``mlp_depth_kv_projection=False``)::
+
+            block i: attn -> slot i  (reads slots 0..i-1)
 
         The ``_WriteDepthSlotKV`` autograd Function (fused K+V) handles
         the in-place slot writes so that gradients still flow from later
-        blocks' depth attention back to the source ``self.kv`` of the
-        writing block. Fusing K and V into one Function call halves the
-        Python-level autograd-dispatch overhead vs a per-buffer Function.
+        blocks' depth attention back to the source ``self.kv`` (or MLP
+        ``kv_proj``) of the writing block. Fusing K and V into one
+        Function call halves the Python-level autograd-dispatch overhead
+        vs a per-buffer Function.
         """
         B, N = x.shape[:2]
         n_layer = self.depth
+        max_depth = self.max_depth
+        slots_per_layer = self.slots_per_layer
         H = self.num_kv_heads
         D = self.head_dim
         # The buffers themselves do not need a grad slot; gradients are
@@ -550,21 +748,51 @@ class MoDAVisionTransformer(nn.Module):
         # before masking them out, and dot-products that include NaN/Inf in
         # an unwritten slot can leak NaN into the masked-out lane in some
         # Triton/HMMA paths. The one-time zero-fill is cheap (one full-buffer
-        # write per forward, vs the per-layer slot writes K1 already pays).
-        buf_k = torch.zeros(B, N * n_layer, H, D, dtype=x.dtype, device=x.device)
-        buf_v = torch.zeros(B, N * n_layer, H, D, dtype=x.dtype, device=x.device)
+        # write per forward, vs the per-block slot writes K1 already pays).
+        #
+        # Buffer dtype must match the autocast dtype (e.g. bf16 under
+        # ``torch.autocast``) rather than ``x.dtype``: under autocast, ``x`` is
+        # the LayerNorm input/output (fp32) but the per-layer ``q``/``k``/``v``
+        # produced by the autocasted ``nn.Linear`` in ``MoDAAttention`` are
+        # bf16, and the kernel requires identical dtypes for ``q`` and
+        # ``cached_k``. Allocating the buffer in fp32 here would force
+        # ``MoDAAttention.forward`` to materialise a *fresh* bf16 copy
+        # ``cached_k.to(q.dtype)`` *every block*, which then gets
+        # ``save_for_backward``'d by the K1 kernel; for L=12 that's ~427 MB
+        # of redundant activations vs the v14 path. ``get_autocast_gpu_dtype``
+        # gives us the active autocast dtype when enabled, falling back to
+        # ``x.dtype`` otherwise.
+        if torch.is_autocast_enabled():
+            cache_dtype = torch.get_autocast_gpu_dtype()
+        else:
+            cache_dtype = x.dtype
+        buf_k = torch.zeros(B, N * max_depth, H, D, dtype=cache_dtype, device=x.device)
+        buf_v = torch.zeros(B, N * max_depth, H, D, dtype=cache_dtype, device=x.device)
 
         bk_state, bv_state = buf_k, buf_v
         for i, blk in enumerate(self.blocks):
-            depth_k = bk_state if i > 0 else None
-            depth_v = bv_state if i > 0 else None
-            x, k, v = blk(x, depth_k=depth_k, depth_v=depth_v, current_depth=i)
-            # Last block's slot is never read; skip the fused write entirely
-            # so we don't pay the tiny BNHK bandwidth + an extra autograd node.
+            attn_slot = i * slots_per_layer
+            current_depth = attn_slot
+            depth_k = bk_state if current_depth > 0 else None
+            depth_v = bv_state if current_depth > 0 else None
+            x, k_attn, v_attn, k_mlp, v_mlp = blk(
+                x, depth_k=depth_k, depth_v=depth_v,
+                current_depth=current_depth,
+            )
+            # Last block's slot(s) are never read; skip the fused write
+            # entirely so we don't pay the tiny BNHK bandwidth + extra
+            # autograd nodes.
             if i + 1 < n_layer:
                 bk_state, bv_state = _WriteDepthSlotKV.apply(
-                    bk_state, bv_state, k, v, i, n_layer,
+                    bk_state, bv_state, k_attn, v_attn, attn_slot, max_depth,
                 )
+                if self.mlp_depth_kv_projection:
+                    # k_mlp / v_mlp are guaranteed non-None for non-final
+                    # blocks; MoDAMlp strips kv_proj on the last layer.
+                    mlp_slot = attn_slot + 1
+                    bk_state, bv_state = _WriteDepthSlotKV.apply(
+                        bk_state, bv_state, k_mlp, v_mlp, mlp_slot, max_depth,
+                    )
         return x
 
     def forward_features(self, x):
@@ -614,20 +842,31 @@ def deit_tiny_gqa_patch16_224(pretrained=False, **kwargs):
 
 
 @register_model
-def deit_tiny_moda_patch16_224(pretrained=False, moda_backend="v14", **kwargs):
+def deit_tiny_moda_patch16_224(pretrained=False, moda_backend="v17",
+                               mlp_depth_kv_projection=True, **kwargs):
     """DeiT-Tiny with MoDA depth-attention.
 
     ``moda_backend`` selects the depth-cache strategy:
-      * ``"v14"`` (default) -- ``parallel_moda`` + per-block stack-from-list
-        cache. Drop-in autograd semantics, ``O(L^2)`` cache-build cost.
-      * ``"v17"`` -- ``parallel_moda_v17`` (K1) + pre-allocated buffer + per-
-        block ``current_depth``. Bit-identical forward + backward to v14
-        but ``O(L)`` cache-build cost and ~12-17% lower peak memory.
+      * ``"v14"`` -- ``parallel_moda`` + per-block stack-from-list cache.
+        Drop-in autograd semantics, ``O(slots^2)`` cache-build cost. Kept
+        available for parity testing / debugging.
+      * ``"v17"`` (default) -- ``parallel_moda_v17`` (K1) + pre-allocated
+        buffer + per-block ``current_depth``. Bit-identical forward +
+        backward to v14 but ``O(slots)`` cache-build cost and ~12-17%
+        lower peak memory; this is the production-recommended path.
+
+    ``mlp_depth_kv_projection`` (default ``True``) controls whether the
+    MLP also writes a slot to the depth cache (BlaGPT-style "dual slot
+    per layer" layout). See :class:`MoDAVisionTransformer` for the
+    semantics. Setting this to ``False`` recovers the original
+    "single slot per layer" DeiT MoDA design.
     """
     model = MoDAVisionTransformer(
         patch_size=16, embed_dim=256, depth=12, num_heads=4, num_kv_heads=1, mlp_ratio=4, qkv_bias=True,
         norm_layer=partial(nn.LayerNorm, eps=1e-6),
-        moda_backend=moda_backend, **kwargs)
+        moda_backend=moda_backend,
+        mlp_depth_kv_projection=mlp_depth_kv_projection,
+        **kwargs)
     model.default_cfg = _cfg()
     if pretrained:
         raise NotImplementedError("No pretrained weights are available for deit_tiny_moda_patch16_224.")

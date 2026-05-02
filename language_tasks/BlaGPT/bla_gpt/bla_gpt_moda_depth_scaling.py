@@ -169,6 +169,36 @@ class _WriteDepthSlotKV(torch.autograd.Function):
         return grad_buf_k, grad_buf_v, slot_grad_k, slot_grad_v, None, None
 
 
+@torch.compiler.disable
+def _v17_write_slot_eager(buf_k, buf_v, k_data, v_data, slot, max_depth):
+    """Eager-only wrapper around :class:`_WriteDepthSlotKV` for the v17 / K1
+    path.
+
+    Why this exists: ``_WriteDepthSlotKV.forward`` uses ``buf.data.copy_()``
+    to bypass the version counter, which is *only* valid in eager autograd
+    (AOTAutograd's compiled backward catches the in-place mutation as a
+    view-aliasing violation). On top of that, even if the apply call is the
+    only graph break, AOTAutograd records the surrounding compiled chunk's
+    ``(buf_k_in, ..., buf_k_out)`` as an input/output passthrough; the
+    *next* iteration's runtime-wrapper validation then trips on the
+    version-counter check ("Output 1 of CompiledFunctionBackward is a view
+    and its base ... has been modified inplace"). Wrapping the apply in a
+    ``@torch.compiler.disable`` function pushes the apply *and* its buf_k
+    plumbing entirely outside any compiled chunk, so dynamo never traces
+    a region in which ``buf_k`` is both an input and a (passthrough)
+    output. This is the precondition for being able to bump
+    ``recompile_limit`` past 8 without the per-iteration startup error.
+
+    Skips the write at ``slot == max_depth - 1`` (no future block reads
+    that slot).
+    """
+    if slot + 1 < max_depth:
+        return _WriteDepthSlotKV.apply(
+            buf_k, buf_v, k_data, v_data, slot, max_depth,
+        )
+    return buf_k, buf_v
+
+
 class MixtureOfDepthsAttention(Attention):
     """Depth + spatial attention head for the MoDA depth-scaling recipe.
 
@@ -240,6 +270,12 @@ class MixtureOfDepthsAttention(Attention):
                 f"must be one of {_MODA_BACKENDS}"
             )
 
+        # When set, the depth cache stores k_norm(k) instead of raw k, so
+        # the per-read k_norm over the entire cached_k (~258x cumulative
+        # k_norm workload reduction across 64 layers) is skipped. See the
+        # config docstring for the numerical-equivalence caveat.
+        self.cache_post_norm_k = getattr(config, "cache_post_norm_k", False)
+
         # Eagerly resolve the kernel so configuration mistakes surface during
         # ``__init__`` rather than mid-training.
         self._parallel_moda = _load_parallel_moda(self.moda_backend)
@@ -280,18 +316,33 @@ class MixtureOfDepthsAttention(Attention):
         q = self._project_query(x, B, T)            # (B, T, h_q, d)
         k, v = self._project_kv(x, B, T)            # each (B, T, h_kv, d)
 
-        # Cache the *pre-norm, pre-RoPE* K/V (matches seed behaviour).
-        # Layout note: ``(B, T, 1, h_kv, d)`` -- ``unsqueeze(2)`` instead of
-        # ``reshape(B*T, h_kv, 1, d).contiguous()`` because (a) ``unsqueeze``
-        # is a free metadata op (no copy) and (b) the kernel-friendly cache
-        # layout is ``(B, T, depth, h_kv, d)`` so the new slot inserts along
-        # ``dim=2`` and the kernel feed becomes a zero-copy ``reshape``.
-        origin_k = k.unsqueeze(2)                   # (B, T, 1, h_kv, d)
-        origin_v = v.unsqueeze(2)
+        # Save a pre-norm reference; ``_apply_norm`` returns a new tensor
+        # and leaves this binding intact. Used as the cache value when
+        # ``cache_post_norm_k=False`` (legacy seed semantics: store
+        # *pre-norm, pre-RoPE* K).
+        raw_k = k
 
         # Steps 3-4: optional RMSNorm + RoPE on Q / K.
         if hasattr(self, "q_norm"):
             q, k = self._apply_norm(q, k)
+
+        # Cache K layout note: ``(B, T, 1, h_kv, d)`` -- ``unsqueeze(2)``
+        # instead of ``reshape(B*T, h_kv, 1, d).contiguous()`` because (a)
+        # ``unsqueeze`` is a free metadata op (no copy) and (b) the
+        # kernel-friendly cache layout is ``(B, T, depth, h_kv, d)`` so
+        # the new slot inserts along ``dim=2`` and the kernel feed
+        # becomes a zero-copy ``reshape``.
+        #
+        # Whether the slot stores pre- or post-norm K is governed by
+        # ``self.cache_post_norm_k`` (see config docstring); RoPE is
+        # skipped either way (depth attention is per-position; q_i and
+        # cached_k[i, *] are same-position, identity rotation).
+        if self.cache_post_norm_k and hasattr(self, "k_norm"):
+            origin_k = k.unsqueeze(2)               # post-norm
+        else:
+            origin_k = raw_k.unsqueeze(2)           # pre-norm (legacy)
+        origin_v = v.unsqueeze(2)
+
         if hasattr(self, "rotary"):
             q, k = self._apply_rotary(q, k, T, T)
 
@@ -320,6 +371,7 @@ class MixtureOfDepthsAttention(Attention):
 
     def _depth_sequence_attention(
         self, q, k, v, k_list, v_list, B, T, current_depth=None,
+        cached_k_pre=None, cached_v_pre=None,
     ):
         """Call ``parallel_moda`` (v14) or ``parallel_moda_v17`` (K1) on the
         (current spatial) + (depth cache) KVs.
@@ -332,11 +384,19 @@ class MixtureOfDepthsAttention(Attention):
             depth); the kernel reads only the first ``current_depth`` slots
             per token. For v14 the ``depth`` axis is the tightly packed
             ``cache_depth`` and ``current_depth`` must be ``None``.
+            cached_k_pre / cached_v_pre  (optional, v17 path only)
+            pre-materialised ``(B, T*current_depth, h_kv, d)`` tensors with
+            fresh storage. When supplied, the local slice-and-reshape on
+            ``k_list`` / ``v_list`` is skipped. This is how
+            :meth:`MixtureOfDepthsAttention._forward_v17` keeps ``buf_k``
+            out of the compiled chunk -- the materialisation runs in eager
+            (see :meth:`_v17_extract_cached_kv`) so AOTAutograd never sees
+            ``buf_k`` as both an input and a passthrough output.
 
         Returns ``(B, h_q, T, d)`` (head-major) so the caller can route the
         result through the inherited ``_project_output``.
         """
-        cache_depth = k_list.size(2)
+        cache_depth = k_list.size(2) if k_list is not None else None
         d = self.head_dim
         h_kv = self.n_kv_head
         h_q = self.n_head
@@ -367,10 +427,26 @@ class MixtureOfDepthsAttention(Attention):
         # layout, so the (B, T*L, h_kv, d) view is zero-copy. This is the
         # main per-block win vs the original ``(B*T, h_kv, L, d)`` layout
         # which forced an ``O(B*T*L*h_kv*d)`` ``permute().contiguous()`` here.
-        cached_k = k_list.reshape(B, T * cache_depth, h_kv, d)
-        cached_v = v_list.reshape(B, T * cache_depth, h_kv, d)
+        #
+        # When the caller has already materialised cached_k/v (the v17 path
+        # does this in :meth:`_v17_extract_cached_kv` to keep ``buf_k`` out
+        # of the compile boundary -- see the docstring there), we skip the
+        # local slice-and-reshape and use those tensors directly.
+        if cached_k_pre is not None and cached_v_pre is not None:
+            cached_k = cached_k_pre
+            cached_v = cached_v_pre
+        else:
+            cached_k = k_list.reshape(B, T * cache_depth, h_kv, d)
+            cached_v = v_list.reshape(B, T * cache_depth, h_kv, d)
 
-        if hasattr(self, "k_norm"):
+        # Apply k_norm at *read* time only when the cache stores raw K
+        # (legacy default). When ``cache_post_norm_k=True`` each slot was
+        # already k_norm'd at write time by the producing layer's k_norm,
+        # so re-norming here would double-apply the RMSNorm scale.
+        # Skipping it cuts the cumulative k_norm workload from
+        # ``Sigma_ell (2*ell*T)`` (over 64 layers, ~64**2 * T tokens) to
+        # ``127 * T`` (one per slot write) -- a ~258x reduction.
+        if hasattr(self, "k_norm") and not self.cache_post_norm_k:
             cached_k = self.k_norm(cached_k)
 
         # No-op when dtypes already match (the common case during training);
@@ -383,8 +459,22 @@ class MixtureOfDepthsAttention(Attention):
         # v14 ignores ``current_depth``; v17 uses it to mask buffer slots
         # ``>= current_depth``. Passing ``None`` makes v17 fall back to
         # ``L_cur = L_max``, i.e. bit-identical to v14 on the same input.
+        #
+        # ``depth_bs`` / ``depth_warps`` override the kernel's per-GPU
+        # defaults for the *backward* depth-cache pass
+        # (``parallel_attn_bwd_kernel_dkv_depth``). The library default for
+        # A100 is ``(128, 8)``, which trips the 163KB shared-memory limit
+        # on A100 80GB once enough layers actually compile under
+        # ``torch.compile`` (``Required: 196608, Hardware limit: 166912``).
+        # ``(64, 4)`` keeps the shared-memory footprint inside the limit
+        # and matches the H800 default; the throughput cost is small for
+        # the depth pass.
         kernel_kwargs = (
-            {"current_depth": current_depth}
+            {
+                "current_depth": current_depth,
+                "depth_bs": 64,
+                "depth_warps": 4,
+            }
             if current_depth is not None and self.moda_backend == "v17"
             else {}
         )
@@ -416,6 +506,44 @@ class MixtureOfDepthsAttention(Attention):
         )
         return y
 
+    @torch.compiler.disable
+    def _v17_extract_cached_kv(self, buf_k, buf_v, current_depth):
+        """Eager-only: materialise ``cached_k`` / ``cached_v`` from the
+        in-place ``buf_k`` / ``buf_v`` as fresh-storage tensors, so the
+        compiled body of :meth:`_forward_v17` never receives ``buf_k``
+        as an input.
+
+        Why ``@torch.compiler.disable`` rather than letting dynamo trace
+        this slice: the goal is to keep ``buf_k`` *entirely* outside any
+        compiled chunk. If dynamo traced through the slice, the compiled
+        chunk would have ``buf_k`` as its input (and as a passthrough
+        output, since ``buf_k`` is also referenced after the chunk for
+        the slot write); AOTAutograd then records the input/output
+        aliasing, and on the *next* iteration's call the runtime wrapper
+        validates the previous backward's saved-state version counters,
+        catches that ``buf_k``'s storage was mutated by the eager slot
+        write between the two forwards, and crashes with the "Output 1
+        of CompiledFunctionBackward is a view ..." error.
+
+        The slice ``[:, :, :current_depth]`` is non-contiguous (sliced
+        along the middle dim of ``(B, T, max_depth, H, D)``); the
+        subsequent ``.reshape`` is forced to ``.contiguous()`` and
+        produces a fresh-storage tensor. Cumulative cost across the 64
+        attention blocks is ``sum(2*N for N in range(64))`` slot copies
+        per K/V buffer (~8 GB combined for the 1.3B / T=512 recipe), the
+        price of being compile-clean.
+        """
+        if current_depth <= 0:
+            return None, None
+        B, T, _, h_kv, d = buf_k.shape
+        cached_k = buf_k[:, :, :current_depth, :, :].reshape(
+            B, T * current_depth, h_kv, d
+        )
+        cached_v = buf_v[:, :, :current_depth, :, :].reshape(
+            B, T * current_depth, h_kv, d
+        )
+        return cached_k, cached_v
+
     def _forward_v17(
         self, x, buf_k, buf_v, current_depth, slot, max_depth,
     ):
@@ -425,7 +553,19 @@ class MixtureOfDepthsAttention(Attention):
 
         Block 0 (``current_depth == 0``) falls back to SDPA so the output is
         bit-identical to v14's block 0 path.
+
+        Compile boundary structure (only relevant under ``torch.compile``):
+        the eager pre-stage ``_v17_extract_cached_kv`` and the eager
+        post-stage ``_v17_write_slot_eager`` bracket a compiled body whose
+        only tensor I/O is ``(x, cached_k, cached_v) -> (out, k_for_cache,
+        v_for_cache)``. ``buf_k`` / ``buf_v`` are never visible to dynamo
+        / AOTAutograd, which sidesteps the "input/output passthrough that
+        gets mutated between iterations" failure mode.
         """
+        cached_k, cached_v = self._v17_extract_cached_kv(
+            buf_k, buf_v, current_depth,
+        )
+
         B, T, C = x.size()
 
         q = self._project_query(x, B, T)
@@ -435,11 +575,22 @@ class MixtureOfDepthsAttention(Attention):
         # (matches v14's ``origin_k`` / ``origin_v``); ``_apply_norm`` and
         # ``_apply_rotary`` return new tensors, so these references stay
         # valid even after ``q, k = self._apply_*(q, k)`` rebinds ``k``.
-        k_for_cache = k
+        # Used when ``cache_post_norm_k=False`` (legacy seed semantics).
         v_for_cache = v
+        raw_k = k
 
         if hasattr(self, "q_norm"):
             q, k = self._apply_norm(q, k)
+
+        # Pick the cache K source AFTER ``_apply_norm`` (so ``k`` is the
+        # post-norm tensor) but BEFORE ``_apply_rotary`` (cache stays
+        # pre-RoPE either way -- see ``cache_post_norm_k`` config
+        # docstring for the same-position justification).
+        if self.cache_post_norm_k and hasattr(self, "k_norm"):
+            k_for_cache = k                          # post-norm, pre-RoPE
+        else:
+            k_for_cache = raw_k                      # pre-norm (legacy)
+
         if hasattr(self, "rotary"):
             q, k = self._apply_rotary(q, k, T, T)
 
@@ -449,19 +600,16 @@ class MixtureOfDepthsAttention(Attention):
             y = self._flash_attention(q_h, k_h, v_h)
         else:
             y = self._depth_sequence_attention(
-                q, k, v, buf_k, buf_v, B, T,
+                q, k, v, k_list=None, v_list=None, B=B, T=T,
                 current_depth=current_depth,
+                cached_k_pre=cached_k, cached_v_pre=cached_v,
             )
 
         out = self._project_output(y, B, T, C)
 
-        # Write the new slot. The very last slot (``slot == max_depth - 1``)
-        # is never read by any future block, so skip its write to save the
-        # BTHd bandwidth + an autograd-graph node.
-        if slot + 1 < max_depth:
-            buf_k, buf_v = _WriteDepthSlotKV.apply(
-                buf_k, buf_v, k_for_cache, v_for_cache, slot, max_depth,
-            )
+        buf_k, buf_v = _v17_write_slot_eager(
+            buf_k, buf_v, k_for_cache, v_for_cache, slot, max_depth,
+        )
 
         return out, buf_k, buf_v
 
@@ -474,23 +622,42 @@ class SwiGLUMLPDepthScalingMoDA(SwiGLUMLPDepthScaling):
     for the actual ``c_proj(silu(c_gate(x)) * c_fc(x))`` forward) and only
     adds an extra ``kv_proj`` whose ``(n_kv_head, head_dim)`` output is
     appended to the depth cache so the next block's attention can see it.
+
+    The ``is_last_layer`` flag drops ``kv_proj`` entirely on the final block:
+    its slot would land at ``2 * n_layer - 1`` (the last slot of the K1 v17
+    buffer), which is never read by any future attention. v14's terminal
+    ``torch.cat`` also goes nowhere (the final block's ``k_list`` / ``v_list``
+    are dropped by :class:`_TupleAwareNorm`). So computing ``kv_proj`` on the
+    last block is pure waste *and* leaves its weight outside the autograd
+    graph, which trips DDP's ``find_unused_parameters=False`` check.
     """
 
-    def __init__(self, config):
+    def __init__(self, config, is_last_layer: bool = False):
         super().__init__(config)
         self.n_head = config.n_head
         self.head_dim = config.n_embd // config.n_head
         self.n_kv_head = config.n_kv_head
         bias = config.bias or getattr(config, "use_qkv_bias", False)
-        self.kv_proj = nn.Linear(
-            config.n_embd, self.n_kv_head * self.head_dim * 2, bias=bias
-        )
+        if is_last_layer:
+            self.kv_proj = None
+        else:
+            self.kv_proj = nn.Linear(
+                config.n_embd, self.n_kv_head * self.head_dim * 2, bias=bias
+            )
         self.moda_backend = getattr(config, "moda_backend", "v14")
         if self.moda_backend not in _MODA_BACKENDS:
             raise ValueError(
                 f"Unknown moda_backend={self.moda_backend!r}; "
                 f"must be one of {_MODA_BACKENDS}"
             )
+        self.cache_post_norm_k = getattr(config, "cache_post_norm_k", False)
+        # NOTE: when ``cache_post_norm_k=True``, the MLP needs to apply
+        # k_norm to its kv_proj output before the slot write. We do *not*
+        # register a separate ``k_norm`` submodule here; instead the
+        # k_norm callable is passed in from :class:`BlockPostNormMoDA` via
+        # the forward kwarg ``k_norm`` so we share the block-attention's
+        # single per-layer ``k_norm.g`` parameter (no extra params, no
+        # state_dict double-registration).
 
     def forward(
         self,
@@ -499,6 +666,7 @@ class SwiGLUMLPDepthScalingMoDA(SwiGLUMLPDepthScaling):
         v_list=None,
         slot=None,
         max_depth=None,
+        k_norm=None,
     ):
         """Dispatch to v14 (cat-based cache) or v17 (K1 buffer) backend.
 
@@ -510,12 +678,19 @@ class SwiGLUMLPDepthScalingMoDA(SwiGLUMLPDepthScaling):
         ``(B, T, max_depth, h_kv, d)`` buffer; the MLP writes its new K/V
         into slot ``slot`` via :class:`_WriteDepthSlotKV` (in-place,
         autograd-correct).
+
+        ``k_norm``: optional callable (the parent block's
+        ``MixtureOfDepthsAttention.k_norm`` instance). When supplied AND
+        ``self.cache_post_norm_k`` is true, the slot's K is normalised
+        before write so the consuming attention can skip its per-read
+        normalisation. ``None`` when either ``cache_post_norm_k=False``
+        (legacy) or the model has no k_norm at all.
         """
         if self.moda_backend == "v17":
-            return self._forward_v17(x, k_list, v_list, slot, max_depth)
-        return self._forward_v14(x, k_list, v_list)
+            return self._forward_v17(x, k_list, v_list, slot, max_depth, k_norm)
+        return self._forward_v14(x, k_list, v_list, k_norm)
 
-    def _forward_v14(self, x, k_list=None, v_list=None):
+    def _forward_v14(self, x, k_list=None, v_list=None, k_norm=None):
         if k_list is None or v_list is None:
             raise RuntimeError(
                 "SwiGLUMLPDepthScalingMoDA requires a non-empty depth cache. "
@@ -523,40 +698,48 @@ class SwiGLUMLPDepthScalingMoDA(SwiGLUMLPDepthScaling):
                 "before this MLP runs."
             )
 
-        B, T, _ = x.shape
-        k, v = (
-            self.kv_proj(x)
-            .view(B, T, 2, self.n_kv_head, self.head_dim)
-            .unbind(dim=2)
-        )
-        # Match :class:`MixtureOfDepthsAttention` cache layout so the kernel
-        # feed stays a zero-copy ``reshape``: store as ``(B, T, 1, h_kv, d)``.
-        origin_k = k.unsqueeze(2)
-        origin_v = v.unsqueeze(2)
-        k_list = torch.cat([k_list, origin_k], dim=2)
-        v_list = torch.cat([v_list, origin_v], dim=2)
+        if self.kv_proj is not None:
+            B, T, _ = x.shape
+            k, v = (
+                self.kv_proj(x)
+                .view(B, T, 2, self.n_kv_head, self.head_dim)
+                .unbind(dim=2)
+            )
+            if self.cache_post_norm_k and k_norm is not None:
+                k = k_norm(k)
+            # Match :class:`MixtureOfDepthsAttention` cache layout so the kernel
+            # feed stays a zero-copy ``reshape``: store as ``(B, T, 1, h_kv, d)``.
+            origin_k = k.unsqueeze(2)
+            origin_v = v.unsqueeze(2)
+            k_list = torch.cat([k_list, origin_k], dim=2)
+            v_list = torch.cat([v_list, origin_v], dim=2)
 
         # SwiGLU forward is inherited (mlp_multiplier hidden dim).
         x = super().forward(x)
         return x, k_list, v_list
 
-    def _forward_v17(self, x, buf_k, buf_v, slot, max_depth):
+    def _forward_v17(self, x, buf_k, buf_v, slot, max_depth, k_norm=None):
         if buf_k is None or buf_v is None:
             raise RuntimeError(
                 "SwiGLUMLPDepthScalingMoDA (v17) requires pre-allocated "
                 "(buf_k, buf_v) buffers; the block must allocate them in "
                 "block 0 and thread them through."
             )
-        B, T, _ = x.shape
-        k, v = (
-            self.kv_proj(x)
-            .view(B, T, 2, self.n_kv_head, self.head_dim)
-            .unbind(dim=2)
-        )
-        # The very last slot is never read; skip the write to save bandwidth
-        # + an autograd-graph node.
-        if slot + 1 < max_depth:
-            buf_k, buf_v = _WriteDepthSlotKV.apply(
+        # The very last slot is never read; skip both the projection and the
+        # buffer write to save a wasted matmul + an autograd-graph node, and
+        # to keep ``kv_proj`` out of the autograd graph (which would otherwise
+        # trip DDP ``find_unused_parameters=False`` since this is the only
+        # path that touches ``kv_proj.weight``).
+        if self.kv_proj is not None and slot + 1 < max_depth:
+            B, T, _ = x.shape
+            k, v = (
+                self.kv_proj(x)
+                .view(B, T, 2, self.n_kv_head, self.head_dim)
+                .unbind(dim=2)
+            )
+            if self.cache_post_norm_k and k_norm is not None:
+                k = k_norm(k)
+            buf_k, buf_v = _v17_write_slot_eager(
                 buf_k, buf_v, k, v, slot, max_depth,
             )
         x = super().forward(x)
@@ -593,7 +776,13 @@ class BlockPostNormMoDA(Block):
         # placeholders) with the merged-v4 + merged-v2 variants that own
         # the depth KV cache plumbing.
         self.attn = MixtureOfDepthsAttention(config)
-        self.mlp = SwiGLUMLPDepthScalingMoDA(config)
+        # The last block's MLP K/V would land at slot ``2 * n_layer - 1``,
+        # which is never read (there is no next attention to consume it).
+        # Tell the MLP to skip ``kv_proj`` entirely on that block so we
+        # don't waste a matmul *and* don't leave a parameter outside the
+        # autograd graph (which would break DDP find_unused_parameters=False).
+        is_last_layer = depth == config.n_layer - 1
+        self.mlp = SwiGLUMLPDepthScalingMoDA(config, is_last_layer=is_last_layer)
 
         self.moda_backend = getattr(config, "moda_backend", "v14")
         # v17 / K1 needs the layer index + total depth to compute slot
@@ -624,7 +813,19 @@ class BlockPostNormMoDA(Block):
         attn_out, k_list, v_list = self.attn(x, k_list=k_list, v_list=v_list)
         x = self.ln_1(x + attn_out)
 
-        mlp_out, k_list, v_list = self.mlp(x, k_list=k_list, v_list=v_list)
+        # When ``cache_post_norm_k=True`` the MLP must apply k_norm to its
+        # kv_proj output before the slot write so that the consumer can
+        # skip the per-read cached_k k_norm. We pass the *attention's*
+        # k_norm so its single per-block ``g`` parameter is shared (no
+        # extra params).
+        mlp_k_norm = (
+            getattr(self.attn, "k_norm", None)
+            if getattr(self.attn, "cache_post_norm_k", False)
+            else None
+        )
+        mlp_out, k_list, v_list = self.mlp(
+            x, k_list=k_list, v_list=v_list, k_norm=mlp_k_norm,
+        )
         x = self.ln_2(x + mlp_out)
 
         return x, k_list, v_list
@@ -667,11 +868,19 @@ class BlockPostNormMoDA(Block):
         )
         x = self.ln_1(x + attn_out)
 
+        # See ``_forward_v14`` for the rationale; same shared-``k_norm``
+        # rule applies under ``cache_post_norm_k=True``.
+        mlp_k_norm = (
+            getattr(self.attn, "k_norm", None)
+            if getattr(self.attn, "cache_post_norm_k", False)
+            else None
+        )
         mlp_slot = 2 * self.layer_idx + 1
         mlp_out, buf_k, buf_v = self.mlp(
             x,
             k_list=buf_k, v_list=buf_v,
             slot=mlp_slot, max_depth=self.max_depth,
+            k_norm=mlp_k_norm,
         )
         x = self.ln_2(x + mlp_out)
 
@@ -720,6 +929,43 @@ class DepthScalingMoDA512T64LPostNorm1p3BConfig(GPTConfig):
     # configurations like this 64-layer recipe (cache rebuild drops from
     # O(L^2) to O(L)).
     moda_backend: str = "v17"
+
+    # When ``True``, the depth KV cache stores ``k_norm(k)`` instead of the
+    # raw ``k`` projection (v is unaffected -- there is no v_norm). The
+    # consuming :meth:`MixtureOfDepthsAttention._depth_sequence_attention`
+    # then skips the per-read ``self.k_norm(cached_k)`` over the entire
+    # depth cache.
+    #
+    # Throughput: each layer ``ell`` would otherwise re-norm the full
+    # ``2*ell*T`` cached tokens; summed over 64 layers that is ``64**2 * T``
+    # k_norm tokens per step, vs ``127 * T`` (one per slot write) when
+    # caching post-norm K -- a ~258x reduction in the k_norm workload (and
+    # the same factor for its backward).
+    #
+    # Numerics: this is *not* bit-equivalent to the legacy path. With
+    # ``cache_post_norm_k=False``, the RMSNorm applied to ``cached_k[:,
+    # slot=s, :]`` uses the *consuming* layer's ``self.k_norm.g`` weight;
+    # with ``cache_post_norm_k=True`` it uses the *writing* layer's
+    # ``k_norm.g`` weight (each block's MLP shares its own attention's
+    # ``k_norm`` instance for the slot it writes, see
+    # :class:`BlockPostNormMoDA.__init__`). For RMSNorm with default init
+    # ``g == 1`` the two are numerically identical at step 0 and diverge
+    # only as training updates the per-layer ``g`` differently. Empirically
+    # bf16 training is robust to this kind of norm-placement reshuffling,
+    # but it must be A/B verified before flipping the default.
+    #
+    # RoPE is still NOT applied to cached K either way (q_i and
+    # cached_k[i, *] are same-position, identity rotation), matching the
+    # seed's "*pre-RoPE*" convention.
+    #
+    # Default is ``True``: bench_components.py (single-GPU eager, B=8 T=512
+    # n_layer=64) measured a 24% step-time reduction (654 ms -> 500 ms),
+    # driven almost entirely by the backward (-153 ms / -34%) since the
+    # cached_k k_norm bwd is the dominant ``O(L**2 * T)`` element-wise
+    # cost. Numerical equivalence at ``g==1`` is bit-identical (verified
+    # in tests/test_cache_post_norm_k_equiv.py); set to ``False`` to
+    # restore the legacy seed semantics for an A/B comparison.
+    cache_post_norm_k: bool = True
 
     # Hyperparameters overrides applied via train.py's
     # ``for k,v in model_config.to_dict(): setattr(args, k, v)`` loop.

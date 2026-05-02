@@ -21,6 +21,16 @@ os.environ["TORCH_NCCL_ASYNC_ERROR_HANDLING"] = "1"
 os.environ["NCCL_TIMEOUT"] = "1800"
 
 torch._dynamo.config.optimize_ddp = False
+# 64-layer MoDA depth-scaling specialises Dynamo's compiled graph per layer
+# (each ``BlockPostNormMoDA`` has a different ``self.layer_idx`` int, and
+# the slot-write graph break creates a resume frame whose ``slot`` is a
+# guard). 64 layers x (attn + mlp) = 128 unique compile keys, so 128 leaves
+# headroom before any cache eviction. Safe to use in tandem with the
+# v17-trim-cached-k change in ``_depth_sequence_attention`` (without that
+# trim, more compiled layers means more chances to hit the AOTAutograd
+# view-aliasing check on ``k_norm`` saving a view of in-place mutated
+# ``buf_k``).
+torch._dynamo.config.recompile_limit = 128
 torch.set_float32_matmul_precision("high")
 
 
@@ -268,7 +278,12 @@ if __name__ == "__main__":
     model = DDP(
         model,
         device_ids=[ddp_local_rank],
-        find_unused_parameters=True,
+        # All MoDA depth-scaling params (attn / mlp / kv_proj / norms / embed
+        # / lm_head) are exercised every step, so we don't need DDP to do the
+        # extra autograd-graph traversal that ``find_unused_parameters=True``
+        # forces. Keeping it ``False`` gives the reducer larger buckets and
+        # better backward / all-reduce overlap.
+        find_unused_parameters=False,
         broadcast_buffers=False,
         gradient_as_bucket_view=True,
     )
