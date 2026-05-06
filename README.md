@@ -25,11 +25,11 @@ Blog ([The Second Half of Model Architecture](https://lh-zhu.github.io/The-Secon
 
 - [x] Release [Mixture-of-Depths Attention (MoDA)](https://arxiv.org/abs/2603.15619) paper on arXiv.
 - [x] Release [The Second Half of Model Architecture](https://lh-zhu.github.io/The-Second-Half-of-Model-Architecture/) blog.
-- [x] Release [MoDA Triton kernel](libs/moda_triton/fla/ops/moda/moda_v14.py) and corresponding test units.
+- [x] Release [MoDA Triton kernel](libs/moda_triton/fla/ops/moda/moda_v17.py) and corresponding test units.
 - [x] Release [Chunk-Visible MoDA Triton kernel](libs/moda_triton/fla/ops/moda/moda_v16.py) and corresponding test units.
 - [x] Release [FDA (Flash Depth Attention) Triton kernel](libs/moda_triton/fla/ops/moda/fda_v12.py) and corresponding test units.
-- [x] Release [Non-Causal MoDA Triton kernel](libs/moda_triton/fla/ops/moda/moda_v14.py) and corresponding test units, note that you only need pass `is_causal=False` to the functions.
-- [ ] Release full LLM training recipe and reproducible configs.
+- [x] Release [Non-Causal MoDA Triton kernel](libs/moda_triton/fla/ops/moda/moda_v17.py) and corresponding test units, note that you only need pass `is_causal=False` to the functions.
+- [x] Release full LLM training recipe and reproducible configs.
 - [x] Release full vision tasks training recipe, i.e., [Classification on ImageNet](vision_tasks/deit).
 
 ## Abstract
@@ -152,12 +152,19 @@ python3 libs/moda_triton/fla/ops/moda/moda_v14.py
 
 ```sh
 cd vision_tasks/deit
-bash scripts/train/deit_t_moda_4gpu.sh
+bash scripts/train/deit_t_moda_64l_4gpu.sh
+```
+
+## Try MoDA on Language Tasks, i.e., [Language Modeling on FineWeb10B](language_tasks/BlaGPT)
+
+```sh
+cd language_tasks/BlaGPT
+bash scripts/debug/moda_depth_scaling.sh
 ```
 
 ## Acknowledgement :heart:
 
-This project is based on [OLMo2](https://github.com/allenai/OLMo) ([paper](https://arxiv.org/abs/2501.00656)), [DeiT](https://github.com/facebookresearch/deit) ([paper](https://arxiv.org/abs/2012.12877)) and [Flash Linear Attention](https://github.com/fla-org/flash-linear-attention) ([paper](https://arxiv.org/abs/2312.06635)). Thanks for their wonderful works.
+This project is based on [OLMo2](https://github.com/allenai/OLMo) ([paper](https://arxiv.org/abs/2501.00656)), [BlaGPT](https://github.com/erogol/BlaGPT), [DeiT](https://github.com/facebookresearch/deit) ([paper](https://arxiv.org/abs/2012.12877)) and [Flash Linear Attention](https://github.com/fla-org/flash-linear-attention) ([paper](https://arxiv.org/abs/2312.06635)). Thanks for their wonderful works.
 
 ## Citation
 
