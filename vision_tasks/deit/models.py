@@ -15,6 +15,7 @@ _MODA_BACKENDS = ("v14", "v17")
 
 __all__ = [
     'deit_tiny_patch16_224', 'deit_tiny_gqa_patch16_224', 'deit_tiny_moda_patch16_224',
+    'deit_tiny_64l_patch16_224', 'deit_tiny_gqa_64l_patch16_224', 'deit_tiny_moda_64l_patch16_224',
     'deit_small_patch16_224', 'deit_base_patch16_224',
     'deit_tiny_distilled_patch16_224', 'deit_small_distilled_patch16_224',
     'deit_base_distilled_patch16_224', 'deit_base_patch16_384',
@@ -870,6 +871,69 @@ def deit_tiny_moda_patch16_224(pretrained=False, moda_backend="v17",
     model.default_cfg = _cfg()
     if pretrained:
         raise NotImplementedError("No pretrained weights are available for deit_tiny_moda_patch16_224.")
+    return model
+
+
+# -----------------------------------------------------------------------------
+# 64-layer depth-scaling variants.
+#
+# These mirror the BlaGPT depth-scaling recipe (see
+# ``bla_gpt/bla_gpt_depth_scaling.py`` and
+# ``bla_gpt/bla_gpt_moda_depth_scaling.py``) on the vision side: same
+# architecture as the 12-layer DeiT-Tiny / GQA / MoDA factories above but
+# stacked 64 blocks deep (``depth=64``) so that DeiT can be used to study
+# depth-scaling behaviour of the MoDA depth-attention mechanism against
+# plain full attention and GQA full attention. All other hyperparameters
+# (``embed_dim``, ``num_heads``, ``num_kv_heads``, ``mlp_ratio``,
+# ``patch_size``, ``img_size``) are kept identical to the 12-layer
+# baselines so the only variable between the matched pair is ``depth``.
+# -----------------------------------------------------------------------------
+
+@register_model
+def deit_tiny_64l_patch16_224(pretrained=False, **kwargs):
+    """DeiT-Tiny scaled to 64 transformer blocks (same width as the 12-layer tiny)."""
+    model = VisionTransformer(
+        patch_size=16, embed_dim=192, depth=64, num_heads=3, mlp_ratio=4, qkv_bias=True,
+        norm_layer=partial(nn.LayerNorm, eps=1e-6), **kwargs)
+    model.default_cfg = _cfg()
+    if pretrained:
+        raise NotImplementedError("No pretrained weights are available for deit_tiny_64l_patch16_224.")
+    return model
+
+
+@register_model
+def deit_tiny_gqa_64l_patch16_224(pretrained=False, **kwargs):
+    """DeiT-Tiny GQA (4 query / 1 KV head) scaled to 64 transformer blocks."""
+    model = GQAVisionTransformer(
+        patch_size=16, embed_dim=256, depth=64, num_heads=4, num_kv_heads=1, mlp_ratio=4, qkv_bias=True,
+        norm_layer=partial(nn.LayerNorm, eps=1e-6), **kwargs)
+    model.default_cfg = _cfg()
+    if pretrained:
+        raise NotImplementedError("No pretrained weights are available for deit_tiny_gqa_64l_patch16_224.")
+    return model
+
+
+@register_model
+def deit_tiny_moda_64l_patch16_224(pretrained=False, moda_backend="v17",
+                                   mlp_depth_kv_projection=True, **kwargs):
+    """DeiT-Tiny MoDA (4 query / 1 KV head) scaled to 64 transformer blocks.
+
+    See :func:`deit_tiny_moda_patch16_224` for the semantics of
+    ``moda_backend`` and ``mlp_depth_kv_projection``. With the default
+    dual-slot-per-layer MoDA cache (``mlp_depth_kv_projection=True``) the
+    cache depth grows to ``2 * depth = 128`` slots, so the depth-attention
+    per block reads up to 127 historical rows -- a substantially deeper
+    cache than the 12-layer recipe and the main reason this recipe exists.
+    """
+    model = MoDAVisionTransformer(
+        patch_size=16, embed_dim=256, depth=64, num_heads=4, num_kv_heads=1, mlp_ratio=4, qkv_bias=True,
+        norm_layer=partial(nn.LayerNorm, eps=1e-6),
+        moda_backend=moda_backend,
+        mlp_depth_kv_projection=mlp_depth_kv_projection,
+        **kwargs)
+    model.default_cfg = _cfg()
+    if pretrained:
+        raise NotImplementedError("No pretrained weights are available for deit_tiny_moda_64l_patch16_224.")
     return model
 
 
